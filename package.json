@@ -1,0 +1,28 @@
+{
+  "name": "simvillage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An LLM-driven AI village simulation: a backend (world engine + minds), a browser frontend, and one shared LLM engine.",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n backend,llm,client -c blue,red,green \"npm:dev:server\" \"npm:dev:llm\" \"npm:dev:client\"",
+    "dev:server": "tsx watch server/src/index.ts",
+    "dev:llm": "tsx watch llm/src/index.ts",
+    "dev:client": "vite",
+    "build": "tsc -p server/tsconfig.json && vite build",
+    "generate": "tsx server/src/world/generate.ts",
+    "typecheck": "tsc -p server/tsconfig.json && tsc -p llm/tsconfig.json && tsc -p client/tsconfig.json"
+  },
+  "dependencies": {
+    "mongodb": "^6.12.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

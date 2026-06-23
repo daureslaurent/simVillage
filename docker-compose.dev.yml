@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Development overlay — hot reload from the host. Opt-in; NOT applied by default.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# It swaps the node services to their `dev` build target (tsx watch / vite dev)
+# and bind-mounts the working tree so host edits reload live. node_modules stays
+# inside the image via an anonymous volume so the host's copy never shadows it.
+# CHOKIDAR_USEPOLLING keeps file-watching reliable across the WSL2 <-> Docker
+# bind-mount boundary.
+# ---------------------------------------------------------------------------
+services:
+  llm:
+    build:
+      target: dev
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    # The dev server has no /health-on-:8090 contract guarantee under watch; skip.
+    healthcheck:
+      disable: true
+
+  backend:
+    build:
+      target: dev
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - .:/app
+      - /app/node_modules
+
+  client:
+    build:
+      target: dev
+    # Vite dev server speaks HTTP on 5173 directly (no nginx in dev).
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - /app/node_modules

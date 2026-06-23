@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // Type-check only: the gateway is executed by `tsx`, not emitted by `tsc`.
+    "noEmit": true
+  },
+  // The gateway shares the wire protocol (client <-> gateway) AND the bus
+  // contract (gateway <-> engine), so it includes both shared/ and bus/.
+  "include": ["src/**/*.ts", "../shared/**/*.ts", "../bus/**/*.ts"]
+}

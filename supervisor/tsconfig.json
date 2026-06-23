@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // Type-check only: the supervisor is executed by `tsx`, not emitted by `tsc`.
+    "noEmit": true
+  },
+  // The god speaks the bus contract and reuses the villager's LLM seam + tool-schema
+  // shape, so it includes shared/, bus/, AND villager/ — but never the client wire types.
+  "include": ["src/**/*.ts", "../shared/**/*.ts", "../bus/**/*.ts", "../villager/**/*.ts"]
+}

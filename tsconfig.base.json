@@ -1,0 +1,24 @@
+{
+  // Shared compiler options inherited by both server/ and client/.
+  // Strictness is intentionally maximal — the project relies on the type
+  // system as the contract between the engine, the wire protocol, and the UI.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    // "Bundler" resolution lets us write extension-less, alias-free relative
+    // imports that BOTH tsx (server) and Vite (client) understand natively.
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  }
+}

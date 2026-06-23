@@ -1,0 +1,210 @@
+# ---------------------------------------------------------------------------
+# simVillage — brought up with `docker compose up --build`:
+#
+#   mongo   -> persistent datastore (world seed + live snapshots)
+#   qdrant  -> vector store for villager long-term memory (RAG)
+#   embed   -> local embedding server (llama.cpp, CUDA) for memory vectors
+#   llm     -> the ONE LLM engine; the only thing that talks to your llama server
+#   backend -> the whole village in one process: world engine + minds + the God
+#              Agent + the browser-facing WebSocket gateway. Persists to mongo,
+#              reaches the llm engine over HTTP.
+#   client  -> the Canvas viewport, built to static files and served by nginx
+#
+# Data flow:
+#   browser <--WS--> backend <--HTTP--> llm <--HTTP--> llama
+#                       |
+#                       +--> mongo (persistence) + qdrant (memory)
+#
+# The node services BUILD their source into self-contained images (esbuild
+# bundle for backend/llm, `vite build` for the client) — nothing is bind-mounted
+# from the host. For a hot-reloading dev workflow that mounts the source, add
+# the dev overlay:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# ---------------------------------------------------------------------------
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Vector database for villager long-term memory (RAG). Used only when
+  # VILLAGER_MEMORY=on on the backend. Rest API on :6333; gRPC on :6334.
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    restart: unless-stopped
+    # Qdrant's RocksDB keeps many segment files open; the host's default file-descriptor
+    # limit is easily exhausted ("Too many open files"), which corrupts writes and
+    # crashes the backend on its next boot. Raise the limit so it stays healthy.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Local embedding server (llama.cpp, CUDA). Serves OpenAI-compatible
+  # /v1/embeddings on :8080 for villager long-term memory. Your chat llama
+  # server is a separate, chat-only box, so embeddings get their own server
+  # here. The GGUF is auto-downloaded from HuggingFace on first boot (-hf) and
+  # cached in the `embed-models` volume, so later starts are instant.
+  #
+  # Requires the NVIDIA Container Toolkit on the host (and, on WSL2, a working
+  # CUDA-in-WSL setup). With no GPU, drop the `deploy:` block and the model runs
+  # on CPU (slower, but fine for short memory strings).
+  embed:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    restart: unless-stopped
+    # nomic-embed-text-v1.5 -> 768-dim vectors (matches EMBED_DIM=768). --alias
+    # pins the model name the server answers to, so EMBED_MODEL must match it.
+    command: >
+      -hf nomic-ai/nomic-embed-text-v1.5-GGUF:Q8_0
+      --alias nomic-embed-text
+      --embeddings
+      --pooling mean
+      -ngl 99
+      --host 0.0.0.0
+      --port 8080
+    environment:
+      # Where -hf caches the downloaded GGUF (persisted by the volume below).
+      LLAMA_CACHE: /models
+    volumes:
+      - embed-models:/models
+    ports:
+      - "8081:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      # First boot downloads the model; give it room before marking unhealthy.
+      start_period: 300s
+
+  # The single LLM engine: the ONE service that talks to the lone llama server.
+  # The backend POSTs all its LLM work here, and the engine serializes it so the
+  # server is never hit concurrently. Run exactly one.
+  llm:
+    build:
+      context: .
+      dockerfile: llm/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    environment:
+      LLM_PORT: ${LLM_PORT:-8090}
+      # The one OpenAI-compatible llama server (comma-separated to pool several
+      # for failover; a single URL is the norm). host.docker.internal reaches a
+      # server on the host.
+      LLAMA_URLS: ${LLAMA_URLS:-http://host.docker.internal:8080}
+      LLAMA_MODEL: ${LLAMA_MODEL:-llama}
+      LLAMA_API_KEY: ${LLAMA_API_KEY:-}
+      LLAMA_TIMEOUT_MS: ${LLAMA_TIMEOUT_MS:-30000}
+      # Embedding model for memory. Defaults to the local `embed` service above;
+      # EMBED_MODEL must match that server's --alias.
+      EMBED_URLS: ${EMBED_URLS:-http://embed:8080}
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      EMBED_DIM: ${EMBED_DIM:-768}
+      # Optional floor on the gap between successive llama calls, in ms (0 = none).
+      LLM_ENGINE_MIN_GAP_MS: ${LLM_ENGINE_MIN_GAP_MS:-0}
+    depends_on:
+      embed:
+        condition: service_healthy
+    ports:
+      - "${LLM_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      # The minds have no brain without the LLM engine.
+      llm:
+        condition: service_started
+      # Vector store for long-term memory (needed only when VILLAGER_MEMORY=on).
+      qdrant:
+        condition: service_started
+    environment:
+      MONGO_URL: ${MONGO_URL:-mongodb://mongo:27017/simvillage}
+      # Where to reach the shared LLM engine.
+      LLM_URL: ${LLM_URL:-http://llm:8090}
+      LLM_CLIENT_TIMEOUT_MS: ${LLM_CLIENT_TIMEOUT_MS:-120000}
+      EMBED_DIM: ${EMBED_DIM:-768}
+      # The browser connects to this WebSocket port (mapped to the host below).
+      GATEWAY_WS_PORT: ${GATEWAY_WS_PORT:-8080}
+      SNAPSHOT_EVERY_TICKS: ${SNAPSHOT_EVERY_TICKS:-50}
+      # Slowed world clock so villagers stay near each other between thoughts.
+      WORLD_TICK_RATE: ${WORLD_TICK_RATE:-3}
+      # The roster of bodies to give minds to: VILLAGER_IDS (comma-separated)
+      # wins; otherwise villager_1..VILLAGER_COUNT. Keep VILLAGER_COUNT equal to
+      # the seed's villager count so every body has a mind.
+      VILLAGER_IDS: ${VILLAGER_IDS:-}
+      VILLAGER_COUNT: ${VILLAGER_COUNT:-5}
+      # Optional per-villager personas, JSON keyed by id, e.g.
+      # {"villager_1":{"name":"Bram","goal":"bake bread"}}.
+      VILLAGER_PROFILES: ${VILLAGER_PROFILES:-}
+      VILLAGER_SENSE_RADIUS: ${VILLAGER_SENSE_RADIUS:-5}
+      # Calmer cadence: one shared server thinks for every mind, and slower
+      # thinking gives villagers time to react to one another.
+      VILLAGER_THINK_INTERVAL_MS: ${VILLAGER_THINK_INTERVAL_MS:-12000}
+      # Turn on long-term memory (needs Qdrant at QDRANT_URL + an embed model).
+      VILLAGER_MEMORY: ${VILLAGER_MEMORY:-on}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      # The God Agent's standing directive + how often it may intervene.
+      SUPERVISOR_CHARTER: ${SUPERVISOR_CHARTER:-}
+      SUPERVISOR_MIN_DAYS_BETWEEN_ACTS: ${SUPERVISOR_MIN_DAYS_BETWEEN_ACTS:-1}
+      VILLAGER_TICKS_PER_DAY: ${VILLAGER_TICKS_PER_DAY:-1000}
+      MIN_ROUND_MS: ${MIN_ROUND_MS:-3000}
+    ports:
+      - "${GATEWAY_WS_PORT:-8080}:8080"
+
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+      target: runtime
+      args:
+        # Baked into the browser bundle at build time. Points at the
+        # host-mapped backend WS port.
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:8080}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    # Host 5173 (the familiar dev URL) -> nginx :80 inside the container.
+    ports:
+      - "5173:80"
+
+volumes:
+  mongo-data:
+  qdrant-data:
+  embed-models:

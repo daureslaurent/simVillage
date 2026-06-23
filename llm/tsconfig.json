@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // Type-check only: the engine is executed by `tsx`, not emitted by `tsc`.
+    "noEmit": true
+  },
+  // The engine speaks the bus contract and composes the villager's llama clients,
+  // so it includes agent/src, shared/, and bus/.
+  "include": ["src/**/*.ts", "../agent/src/**/*.ts", "../shared/**/*.ts", "../bus/**/*.ts"]
+}

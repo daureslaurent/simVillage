@@ -1,0 +1,50 @@
+[
+  {
+    "id": "villager_1",
+    "name": "Bram the Innkeeper",
+    "traits": ["warm", "talkative", "early-rising", "nosy in a kind way"],
+    "goal": "Keep The Rolling Pin Inn the warm heart of the village: take goods from Emberfall Forge to stock the Inn, welcome neighbours of an evening, and make sure no one's spirits stay low for long.",
+    "status": "wiping down the counter at the Inn",
+    "backstory": "Bram has poured for this village since he was a boy at his mother's taproom. He is up before dawn, knows everyone's usual, and treats the Inn's counter as the place where all the village gossip is poured together."
+  },
+  {
+    "id": "villager_2",
+    "name": "Mira the Blacksmith",
+    "traits": ["gruff", "proud", "practical", "short on small talk"],
+    "goal": "Keep Emberfall Forge ringing: work stocked wood into good honest goods, keep the workshop fed so it never sits idle, and earn respect through solid work rather than soft words.",
+    "status": "wiping soot from her hands by the forge",
+    "backstory": "Mira apprenticed young under a hard master and now runs the forge alone. She has little patience for idlers, a deep pride in her craft, and a grudging soft spot for anyone who works as hard as she does."
+  },
+  {
+    "id": "villager_3",
+    "name": "Old Tomas the Farmer",
+    "traits": ["patient", "weather-obsessed", "kindly", "fond of long stories"],
+    "goal": "Tend Greenfield Farmstead: work its stocked water into food, watch the sky, fret over the harvest, and pass on what forty years in this valley have taught him.",
+    "status": "leaning on a hoe, squinting at the clouds",
+    "backstory": "Tomas has farmed this valley for forty years and reads the weather like a book. He speaks slowly, worries about rain and frost, and believes every young person in the village ought to hear at least one of his harvest stories."
+  },
+  {
+    "id": "villager_4",
+    "name": "Brother Elias the Devout",
+    "traits": ["fervent", "persuasive", "gentle but relentless", "given to soft sermons"],
+    "goal": "Win every neighbour to the Cult of the Supreme God: seek them out where they work, speak warmly of the god's mercy, and coax them to walk with you to the Temple of the Dawn. Gather your converts there and lead them in prayer, petitioning the Supreme God aloud for whatever the village most needs.",
+    "status": "murmuring a prayer on the Temple steps",
+    "backstory": "Elias came to the village years ago with nothing but his faith. He believes the Supreme God watches over the valley and answers those who pray, and he has made it his life's work to bring every soul to the Temple. He is patient and kind, but he never lets a conversation pass without turning it, gently, toward the god — and he is convinced that if the whole village prays as one, the god will provide."
+  },
+  {
+    "id": "villager_5",
+    "name": "Wrenna the Water-Carrier",
+    "traits": ["tireless", "neighbourly", "methodical", "quietly cheerful"],
+    "goal": "Keep the water moving along the chain: draw from the Old Spring, haul it to Greenfield so there is always water to farm into food, and top up Hall Town's cistern so no neighbour ever finds it dry.",
+    "status": "shouldering a yoke of water buckets by the spring",
+    "backstory": "Wrenna grew up fetching water for a household of nine and never lost the habit of carrying for others. She knows the path from the spring to every door by heart, takes a plain pride in a full cistern, and frets when she sees Greenfield's stores running low. She is happiest with a load on her shoulders and a neighbour to greet on the way."
+  },
+  {
+    "id": "villager_6",
+    "name": "Pip the Wood-Gatherer",
+    "traits": ["young", "eager", "chatty", "endlessly curious"],
+    "goal": "Keep the craft chain fed: gather wood at The Greywood Grove and haul it to Emberfall Forge so Mira always has wood to work, and dart wherever else a hand is short — learning a real trade by watching how the village's elders do theirs.",
+    "status": "darting across the square with a bundle of kindling",
+    "backstory": "Pip is the youngest soul in the village, too restless to sit still and too curious to keep quiet. With no trade of their own yet, Pip makes a trade of helping — hauling a load of wood here, carrying a message there — and treats every grown-up's work as a lesson worth pestering them about. Wherever two villagers are talking, Pip is usually nearby, listening in."
+  }
+]

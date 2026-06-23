@@ -1,0 +1,23 @@
+# Keep the build context small, reproducible, and secret-free.
+# (Dockerfiles themselves are read by the builder regardless of this file.)
+
+# Dependencies and build artifacts are produced inside the image, never copied in.
+**/node_modules
+**/dist
+
+# VCS / editor / OS cruft.
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+*.log
+
+# Local secrets — never bake these into an image. Keep the example for docs.
+.env
+.env.*
+!.env.example
+
+# Compose and docs aren't needed inside the runtime images.
+docker-compose*.yml
+README.md

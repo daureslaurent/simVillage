@@ -1,0 +1,19 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // Type-check only: the server is executed by `tsx`, not emitted by `tsc`.
+    "noEmit": true
+  },
+  // The backend now composes every in-process service, so it type-checks the
+  // shared protocol, the bus, and the gateway/villager/supervisor sources it
+  // wires together.
+  "include": [
+    "src/**/*.ts",
+    "../shared/**/*.ts",
+    "../bus/**/*.ts",
+    "../gateway/src/**/*.ts",
+    "../agent/src/**/*.ts",
+    "../supervisor/src/**/*.ts"
+  ]
+}
