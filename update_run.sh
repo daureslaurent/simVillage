@@ -6,10 +6,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "==> Updating main from git..."
-git fetch origin main
-git checkout main
-git reset --hard origin/main
+echo "==> Updating master from git..."
+git fetch origin master
+git checkout master
+git reset --hard origin/master
 
 # Build the new images while the old containers keep running — no downtime
 # during the (slow) build step.
