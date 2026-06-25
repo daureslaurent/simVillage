@@ -23,6 +23,10 @@ docker compose build
 # Recreate only the services whose image/config changed (backend, frontend).
 # Mongo is untouched — no replica-set re-init, no transaction interruption — so
 # downtime is just the few seconds it takes to swap the changed containers.
+
+echo "==> Wipe volumes..."
+ocker compose down -v
+
 echo "==> Swapping in new containers..."
 docker compose up -d
 
