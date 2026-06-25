@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 #
 # update_run.sh — rapid update & relaunch for a remote server.
-# Fetches the latest main, then rebuilds and restarts the stack.
+# Fetches the latest master, then rebuilds and restarts the stack.
 set -euo pipefail
 
 cd "$(dirname "$0")"
+
+# Pin the compose project name so container/image naming and the prune filter
+# below are deterministic regardless of the checkout directory's name.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-simvillage}"
 
 echo "==> Updating master from git..."
 git fetch origin master
@@ -25,7 +29,7 @@ docker compose up -d
 # Drop now-dangling old image layers freed by the rebuild. Scoped to this
 # compose project so other running stacks' images are left alone.
 echo "==> Pruning old images..."
-docker image prune -f --filter "label=com.docker.compose.project=cryptobot"
+docker image prune -f --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}"
 
 echo "==> Done. Container status:"
 docker compose ps
