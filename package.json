@@ -11,7 +11,9 @@
     "dev:client": "vite",
     "build": "tsc -p server/tsconfig.json && vite build",
     "generate": "tsx server/src/world/generate.ts",
-    "typecheck": "tsc -p server/tsconfig.json && tsc -p llm/tsconfig.json && tsc -p client/tsconfig.json"
+    "typecheck": "tsc -p server/tsconfig.json && tsc -p llm/tsconfig.json && tsc -p client/tsconfig.json",
+    "appver": "node -p \"require('./package.json').version + '.' + require('child_process').execSync('git rev-list --count HEAD').toString().trim()\"",
+    "up": "APP_VERSION=\"$(npm run -s appver)\" docker compose up --build"
   },
   "dependencies": {
     "mongodb": "^6.12.0",

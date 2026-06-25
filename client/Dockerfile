@@ -30,6 +30,10 @@ WORKDIR /app
 COPY . .
 ARG VITE_WS_URL
 ENV VITE_WS_URL=${VITE_WS_URL}
+# .git isn't in the build context, so vite can't count commits itself — the
+# version string is computed on the host and passed in here.
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION}
 RUN npx vite build
 
 # --- runtime: static files behind nginx ------------------------------------

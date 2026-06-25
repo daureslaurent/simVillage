@@ -224,6 +224,10 @@ services:
         # nginx reverse-proxies to the backend. Set this only to point the
         # browser at some other gateway directly.
         VITE_WS_URL: ${VITE_WS_URL:-}
+        # Version stamp shown in the topbar. Computed on the host (where .git
+        # lives) and injected here; `npm run up` sets it. Empty -> vite falls
+        # back to package.json's version with a '.0' commit count.
+        APP_VERSION: ${APP_VERSION:-}
     restart: unless-stopped
     depends_on:
       - backend

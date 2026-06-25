@@ -7,7 +7,10 @@ const commitCount = (() => {
   try { return execSync('git rev-list --count HEAD', { encoding: 'utf-8' }).trim(); }
   catch { return '0'; }
 })();
-const APP_VERSION = `${pkg.version}.${commitCount}`;
+// Prefer a version injected from the host (APP_VERSION build arg) — inside the
+// Docker build there is no .git, so the git read above would always yield '0'.
+// `npm run up` computes it from host git; a local `npm run build` uses git directly.
+const APP_VERSION = process.env.APP_VERSION || `${pkg.version}.${commitCount}`;
 
 /**
  * Vite config lives at the project root so the `vite` / `vite build` scripts
