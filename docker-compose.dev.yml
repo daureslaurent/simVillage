@@ -30,11 +30,18 @@ services:
     volumes:
       - .:/app
       - /app/node_modules
+    # In dev there's no nginx proxy (Vite serves the client directly), so the
+    # browser reaches the gateway itself — re-publish the WS/REST port to the host.
+    ports:
+      - "${GATEWAY_WS_PORT:-8080}:8080"
 
   client:
     build:
       target: dev
-    # Vite dev server speaks HTTP on 5173 directly (no nginx in dev).
+    # Vite dev server speaks HTTP on 5173 directly (no nginx in dev). With no
+    # reverse proxy, point the browser straight at the host-published backend.
+    environment:
+      VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:8080}
     ports:
       - "5173:5173"
     volumes:

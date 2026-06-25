@@ -45,10 +45,13 @@ import type {
 // Stamp the version badge in the topbar.
 (document.getElementById('app-version') as HTMLElement).textContent = `v${__APP_VERSION__}`;
 
-// The WS endpoint is injected at build time (docker-compose), with a sensible
-// localhost fallback for running the client outside Docker.
+// The WS endpoint can be injected at build time (VITE_WS_URL), but by default
+// the browser talks to its OWN origin — nginx serving this bundle reverse-proxies
+// the WS/REST to the backend, which is not exposed to the host. (`||` so an empty
+// build arg falls through to the same-origin default.)
 const WS_URL =
-  import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8080`;
+  import.meta.env.VITE_WS_URL ||
+  `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
 
 // The gateway's HTTP base is the same host/port as the WebSocket — it serves the
 // action-history endpoint alongside the WS upgrade. Derive it from WS_URL by

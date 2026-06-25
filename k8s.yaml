@@ -1,0 +1,76 @@
+---
+# 1. The Service (No Selector)
+apiVersion: v1
+kind: Service
+metadata:
+  name: village-frontend-svc
+  namespace: village
+spec:
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 5173
+
+---
+# 2. The Endpoints (Bridges K8s to your Docker Host)
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: village-frontend-svc # Must match the Service name exactly
+  namespace: village
+subsets:
+  - addresses:
+      - ip: 217.182.71.175 # <--- CHANGE THIS to your OVH Public IP
+    ports:
+      - name: http
+        port: 5173
+
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: village-frontend-slice # The name here can be anything...
+  namespace: village
+  labels:
+    # ...but THIS LABEL is strictly required. It tells K8s to attach
+    # this IP to the 'village-frontend-svc' Service above.
+    kubernetes.io/service-name: village-frontend-svc
+addressType: IPv4
+ports:
+  - name: http
+    protocol: TCP
+    port: 5172
+endpoints:
+  - addresses:
+      - "217.182.71.175" # <--- CHANGE THIS to your OVH Public IP
+
+---
+# 3. The Ingress (Handles SSL and External Traffic)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: village-ingress
+  namespace: village
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls.certresolver: ovh
+    # Prevents WebSocket connections from dropping too quickly
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - village.lda-dev.com # <--- CHANGE THIS to your domain
+      secretName: village-tls-secret
+  rules:
+    - host: village.lda-dev.com # <--- CHANGE THIS to your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: village-frontend-svc
+                port:
+                  number: 80

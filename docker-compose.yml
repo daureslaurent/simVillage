@@ -11,9 +11,18 @@
 #   client  -> the Canvas viewport, built to static files and served by nginx
 #
 # Data flow:
-#   browser <--WS--> backend <--HTTP--> llm <--HTTP--> llama
-#                       |
-#                       +--> mongo (persistence) + qdrant (memory)
+#   browser <--WS/HTTP--> client(nginx) --proxy--> backend <--HTTP--> llm <--> llama
+#                                                      |
+#                                                      +--> mongo + qdrant
+#
+# Network exposure:
+#   Only the `client` service publishes a host port (5173). Everything else lives
+#   on internal Docker networks the host cannot reach inbound:
+#     core -> mongo, qdrant, embed, llm, backend  (the engine room)
+#     edge -> backend, client                     (the only path to the browser)
+#   The browser hits the client's own origin; nginx reverse-proxies the WebSocket
+#   and REST calls to the backend across `edge`. So the village is reachable from
+#   the host at exactly one place — http://localhost:5173 — and nowhere else.
 #
 # The node services BUILD their source into self-contained images (esbuild
 # bundle for backend/llm, `vite build` for the client) — nothing is bind-mounted
@@ -26,8 +35,7 @@ services:
   mongo:
     image: mongo:7
     restart: unless-stopped
-    ports:
-      - "27017:27017"
+    networks: [core]
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -48,9 +56,7 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    ports:
-      - "6333:6333"
-      - "6334:6334"
+    networks: [core]
     volumes:
       - qdrant-data:/qdrant/storage
     healthcheck:
@@ -59,17 +65,18 @@ services:
       timeout: 5s
       retries: 5
 
-  # Local embedding server (llama.cpp, CUDA). Serves OpenAI-compatible
+  # Local embedding server (llama.cpp, CPU). Serves OpenAI-compatible
   # /v1/embeddings on :8080 for villager long-term memory. Your chat llama
   # server is a separate, chat-only box, so embeddings get their own server
   # here. The GGUF is auto-downloaded from HuggingFace on first boot (-hf) and
   # cached in the `embed-models` volume, so later starts are instant.
   #
-  # Requires the NVIDIA Container Toolkit on the host (and, on WSL2, a working
-  # CUDA-in-WSL setup). With no GPU, drop the `deploy:` block and the model runs
-  # on CPU (slower, but fine for short memory strings).
+  # CPU build — runs anywhere, no GPU needed (e.g. an OVH VPS). nomic-embed is
+  # tiny and memory strings are short, so CPU is fine. To use an NVIDIA GPU
+  # instead, switch the image to `:server-cuda`, add `-ngl 99` to the command,
+  # and add a `deploy.resources.reservations.devices` nvidia block.
   embed:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    image: ghcr.io/ggml-org/llama.cpp:server
     restart: unless-stopped
     # nomic-embed-text-v1.5 -> 768-dim vectors (matches EMBED_DIM=768). --alias
     # pins the model name the server answers to, so EMBED_MODEL must match it.
@@ -78,23 +85,14 @@ services:
       --alias nomic-embed-text
       --embeddings
       --pooling mean
-      -ngl 99
       --host 0.0.0.0
       --port 8080
     environment:
       # Where -hf caches the downloaded GGUF (persisted by the volume below).
       LLAMA_CACHE: /models
+    networks: [core]
     volumes:
       - embed-models:/models
-    ports:
-      - "8081:8080"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 15s
@@ -138,8 +136,12 @@ services:
     depends_on:
       embed:
         condition: service_healthy
-    ports:
-      - "${LLM_PORT:-8090}:8090"
+    networks: [core]
+    # The llm engine reaches the host's llama server via host.docker.internal.
+    # That name is automatic on Docker Desktop; pin it explicitly so a plain
+    # Linux Docker (where it isn't) still resolves to the host gateway.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
       interval: 15s
@@ -207,8 +209,9 @@ services:
       SUPERVISOR_MIN_DAYS_BETWEEN_ACTS: ${SUPERVISOR_MIN_DAYS_BETWEEN_ACTS:-1}
       VILLAGER_TICKS_PER_DAY: ${VILLAGER_TICKS_PER_DAY:-1000}
       MIN_ROUND_MS: ${MIN_ROUND_MS:-3000}
-    ports:
-      - "${GATEWAY_WS_PORT:-8080}:8080"
+    # No host port: the browser never reaches the gateway directly. `core` talks
+    # to mongo/qdrant/llm; `edge` is the lone link the client's nginx proxies over.
+    networks: [core, edge]
 
   client:
     build:
@@ -216,15 +219,26 @@ services:
       dockerfile: client/Dockerfile
       target: runtime
       args:
-        # Baked into the browser bundle at build time. Points at the
-        # host-mapped backend WS port.
-        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:8080}
+        # Baked into the browser bundle at build time. Empty by default: the
+        # bundle then connects to its OWN origin (the page's host:port), which
+        # nginx reverse-proxies to the backend. Set this only to point the
+        # browser at some other gateway directly.
+        VITE_WS_URL: ${VITE_WS_URL:-}
     restart: unless-stopped
     depends_on:
       - backend
+    # The ONLY service exposed to the host. nginx serves the static bundle and
+    # proxies the WS + REST through to the backend over `edge`.
+    networks: [edge]
     # Host 5173 (the familiar dev URL) -> nginx :80 inside the container.
     ports:
       - "5173:80"
+
+networks:
+  # The engine room — backend talks to mongo/qdrant/llm here. No host exposure.
+  core:
+  # The single hop between the client's nginx and the backend gateway.
+  edge:
 
 volumes:
   mongo-data:
