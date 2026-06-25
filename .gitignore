@@ -5,6 +5,5 @@ dist/
 /.env
 /.idea/misc.xml
 /.idea/modules.xml
-/package-lock.json
 /.idea/simVillage.iml
 /.idea/vcs.xml
