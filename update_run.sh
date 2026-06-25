@@ -25,7 +25,7 @@ docker compose build
 # downtime is just the few seconds it takes to swap the changed containers.
 
 echo "==> Wipe volumes..."
-ocker compose down -v
+docker compose down -v
 
 echo "==> Swapping in new containers..."
 docker compose up -d
