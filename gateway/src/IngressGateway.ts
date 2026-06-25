@@ -30,10 +30,17 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import {
   EXCHANGES,
+  type EngineReasoningEffortEvent,
+  type EngineLlmModelEvent,
+  type EngineLlmPoolEvent,
+  type LlmCallDeltaEvent,
   type LlmCallFinishedEvent,
   type LlmCallStartedEvent,
   type SimTickEvent,
   type SupervisorCommandEvent,
+  type SupervisorDailyReportEvent,
+  type VillagerAgendaEvent,
+  type VillagerAgendaRemovedEvent,
   type VillagerConversationEvent,
   type VillagerGroupPlanEvent,
   type VillagerIntentEvent,
@@ -43,12 +50,16 @@ import {
 } from '../../shared/events';
 import type { EventBus } from '../../bus/EventBus';
 import { makeEvent } from '../../bus/EventBus';
-import type {
-  BrowserCommand,
-  ServerMessage,
-  WeatherKind,
-  WorldInitMessage,
-  WorldStateUpdate,
+import {
+  isEffortPurpose,
+  isReasoningEffort,
+  type BrowserCommand,
+  type ServerMessage,
+  type WeatherKind,
+  type WorldInitMessage,
+  type WorldGeneratingMessage,
+  type WorldNeedsSetupMessage,
+  type WorldStateUpdate,
 } from '../../shared/types';
 
 /** The weather states a browser may set (the closed vocabulary the gateway trusts). */
@@ -83,8 +94,32 @@ export interface GroupPlanReader {
   all(): import('../../shared/types').GroupPlan[];
 }
 
+/** Read-only view of every villager's live agenda items, for the agenda endpoint. */
+export interface AgendaReader {
+  all(): import('../../shared/types').AgendaItem[];
+}
+
+/** Read-only view of the god's nightly chronicles, for the summary-history endpoint. */
+export interface DailyReportReader {
+  list(limit?: number): Promise<import('../../shared/events').SupervisorDailyReportPayload[]>;
+}
+
+/** Read-only view of villagers' static identities, for the persona endpoint. */
+export interface PersonaReader {
+  get(villagerId: string): import('../../shared/types').VillagerPersona | null;
+}
+
+/** Read-only view of a villager's stored memories, for the memories endpoint. */
+export interface MemoryReader {
+  recent(villagerId: string, limit: number): Promise<import('../../shared/types').VillagerMemory[]>;
+}
+
 /** Matches `GET /villagers/:id/actions`, capturing the (url-encoded) villager id. */
 const ACTIONS_ROUTE = /^\/villagers\/([^/]+)\/actions\/?$/;
+/** Matches `GET /villagers/:id/persona`, capturing the (url-encoded) villager id. */
+const PERSONA_ROUTE = /^\/villagers\/([^/]+)\/persona\/?$/;
+/** Matches `GET /villagers/:id/memories`, capturing the (url-encoded) villager id. */
+const MEMORIES_ROUTE = /^\/villagers\/([^/]+)\/memories\/?$/;
 /** Matches `GET /conversations`. */
 const CONVERSATIONS_ROUTE = /^\/conversations\/?$/;
 /** Matches `GET /buildings/:id/log`, capturing the (url-encoded) building id. */
@@ -93,6 +128,10 @@ const BUILDING_LOG_ROUTE = /^\/buildings\/([^/]+)\/log\/?$/;
 const RELATIONSHIPS_ROUTE = /^\/relationships\/?$/;
 /** Matches `GET /group-plans`. */
 const GROUP_PLANS_ROUTE = /^\/group-plans\/?$/;
+/** Matches `GET /agenda`. */
+const AGENDA_ROUTE = /^\/agenda\/?$/;
+/** Matches `GET /daily-reports`. */
+const DAILY_REPORTS_ROUTE = /^\/daily-reports\/?$/;
 
 export class IngressGateway {
   private readonly http: HttpServer;
@@ -100,10 +139,26 @@ export class IngressGateway {
 
   /** Latest static-world message, replayed to each newly-connected browser. */
   private lastInit: WorldInitMessage | null = null;
+  /**
+   * Latest world-generation progress, replayed to a browser that connects mid-build
+   * so it shows the loading overlay at once. Cleared when `world.init` arrives (the
+   * world now exists), so a browser connecting after generation never sees it.
+   */
+  private lastGenerating: WorldGeneratingMessage | null = null;
+  /**
+   * The first-run setup prompt, replayed to a browser that connects while the backend
+   * is awaiting the player's choice. Cleared once generation starts or a world exists.
+   */
+  private lastNeedsSetup: WorldNeedsSetupMessage | null = null;
   /** Latest per-tick state, replayed so the viewport is populated immediately. */
   private lastState: WorldStateUpdate | null = null;
   /** Latest logical-tick announcement, replayed so the debug window starts in sync. */
   private lastSimTick: ServerMessage | null = null;
+  /** Latest reasoning-effort config, replayed so the Settings window opens in sync. */
+  private lastEffort: ServerMessage | null = null;
+  /** Latest chat-model config, replayed so the Settings window's model picker opens in sync. */
+  private lastModel: ServerMessage | null = null;
+  private lastPool: ServerMessage | null = null;
 
   constructor(
     private readonly bus: EventBus,
@@ -119,6 +174,14 @@ export class IngressGateway {
     private readonly relationships: RelationshipReader | null = null,
     /** Read side of the village's active group plans, for the agenda endpoint. */
     private readonly groupPlans: GroupPlanReader | null = null,
+    /** Read side of the god's nightly chronicles, for the summary-history endpoint. */
+    private readonly dailyReports: DailyReportReader | null = null,
+    /** Read side of every villager's agenda (notes + scheduled events), for `/agenda`. */
+    private readonly agenda: AgendaReader | null = null,
+    /** Read side of villagers' static identities, for `/villagers/:id/persona`. */
+    private readonly personas: PersonaReader | null = null,
+    /** Read side of a villager's stored memories, for `/villagers/:id/memories`. */
+    private readonly memories: MemoryReader | null = null,
   ) {
     this.http = createServer((req, res) => this.handleHttp(req, res));
     this.wss = new WebSocketServer({ server: this.http });
@@ -164,6 +227,19 @@ export class IngressGateway {
       (event) => this.broadcast({ kind: 'group_plan.updated', plan: event.payload }),
     );
 
+    // DOWN: the agenda feed. Forward each created/changed agenda item and each
+    // removal so the browser's Agenda card mirrors the whole village's plans live.
+    await this.bus.subscribe<VillagerAgendaEvent>(
+      EXCHANGES.villagerTelemetry,
+      'villager.agenda.updated',
+      (event) => this.broadcast({ kind: 'agenda.updated', item: event.payload }),
+    );
+    await this.bus.subscribe<VillagerAgendaRemovedEvent>(
+      EXCHANGES.villagerTelemetry,
+      'villager.agenda.removed',
+      (event) => this.broadcast({ kind: 'agenda.removed', itemId: event.payload.itemId }),
+    );
+
     // DOWN: the logical-tick clock. Forward each round's `sim.tick` so the debug
     // window can show the current tick and who is acting vs. cooling down.
     await this.bus.subscribe<SimTickEvent>(
@@ -182,10 +258,50 @@ export class IngressGateway {
       'engine.llm.started',
       (event) => this.broadcast({ kind: 'engine.llm.started', ...event.payload }),
     );
+    // The token stream of each in-flight `/decide` call, for the Live LLM window.
+    await this.bus.subscribe<LlmCallDeltaEvent>(
+      EXCHANGES.engineTelemetry,
+      'engine.llm.delta',
+      (event) => this.broadcast({ kind: 'engine.llm.delta', ...event.payload }),
+    );
     await this.bus.subscribe<LlmCallFinishedEvent>(
       EXCHANGES.engineTelemetry,
       'engine.llm.finished',
       (event) => this.broadcast({ kind: 'engine.llm.finished', ...event.payload }),
+    );
+
+    // DOWN: the current reasoning-effort config. Cache the latest (so a newly-
+    // connected browser's Settings window opens already in sync) and broadcast each
+    // change so every open tab updates together.
+    await this.bus.subscribe<EngineReasoningEffortEvent>(
+      EXCHANGES.engineTelemetry,
+      'engine.reasoning_effort',
+      (event) => {
+        this.lastEffort = { kind: 'reasoning.effort', settings: event.payload.settings };
+        this.broadcast(this.lastEffort);
+      },
+    );
+
+    // DOWN: the current chat-model config (current model + discovered list). Cached
+    // for replay on connect and re-broadcast on every change/refresh, same as effort.
+    await this.bus.subscribe<EngineLlmModelEvent>(
+      EXCHANGES.engineTelemetry,
+      'engine.llm_model',
+      (event) => {
+        this.lastModel = { kind: 'llm.model', config: event.payload.config };
+        this.broadcast(this.lastModel);
+      },
+    );
+
+    // DOWN: the LLM POOL shape (endpoints + live busy flags), polled by the backend
+    // and pushed on a short interval. Cached for replay on connect, like the model.
+    await this.bus.subscribe<EngineLlmPoolEvent>(
+      EXCHANGES.engineTelemetry,
+      'engine.llm_pool',
+      (event) => {
+        this.lastPool = { kind: 'llm.pool', config: event.payload.config };
+        this.broadcast(this.lastPool);
+      },
     );
 
     // DOWN: the temple PRAYER feed. Each villager prayer is surfaced live to the
@@ -217,6 +333,14 @@ export class IngressGateway {
         const act = this.describeSupervisorAction(event);
         if (act) this.broadcast({ kind: 'supervisor.action', action: act.action, summary: act.summary });
       },
+    );
+
+    // DOWN: the god's nightly CHRONICLE. Forward each day's report to the browser
+    // so the summary window can pop it up (and append it to its history).
+    await this.bus.subscribe<SupervisorDailyReportEvent>(
+      EXCHANGES.villageEvents,
+      'village.daily_report',
+      (event) => this.broadcast({ kind: 'supervisor.daily_report', report: event.payload }),
     );
 
     this.wss.on('connection', (socket) => this.handleConnection(socket));
@@ -257,6 +381,16 @@ export class IngressGateway {
         void this.serveActions(decodeURIComponent(actionsMatch[1]), res);
         return;
       }
+      const personaMatch = PERSONA_ROUTE.exec(path);
+      if (personaMatch) {
+        this.servePersona(decodeURIComponent(personaMatch[1]), res);
+        return;
+      }
+      const memoriesMatch = MEMORIES_ROUTE.exec(path);
+      if (memoriesMatch) {
+        void this.serveMemories(decodeURIComponent(memoriesMatch[1]), res);
+        return;
+      }
       if (CONVERSATIONS_ROUTE.test(path)) {
         void this.serveConversations(res);
         return;
@@ -272,6 +406,14 @@ export class IngressGateway {
       }
       if (GROUP_PLANS_ROUTE.test(path)) {
         this.serveJson(res, this.groupPlans?.all() ?? []);
+        return;
+      }
+      if (AGENDA_ROUTE.test(path)) {
+        this.serveJson(res, this.agenda?.all() ?? []);
+        return;
+      }
+      if (DAILY_REPORTS_ROUTE.test(path)) {
+        void this.serveDailyReports(res);
         return;
       }
     }
@@ -297,6 +439,35 @@ export class IngressGateway {
     }
   }
 
+  /** Serve `GET /villagers/:id/persona` — the villager's static identity. */
+  private servePersona(villagerId: string, res: ServerResponse): void {
+    const persona = this.personas?.get(villagerId) ?? null;
+    if (!persona) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'persona unavailable' }));
+      return;
+    }
+    this.serveJson(res, persona);
+  }
+
+  /** Serve `GET /villagers/:id/memories` — the villager's stored memories, newest first. */
+  private async serveMemories(villagerId: string, res: ServerResponse): Promise<void> {
+    if (!this.memories) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'memory store unavailable' }));
+      return;
+    }
+    try {
+      const records = await this.memories.recent(villagerId, 60);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(records));
+    } catch (err) {
+      console.warn('[gateway] memories failed:', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'failed to load memories' }));
+    }
+  }
+
   private async serveConversations(res: ServerResponse): Promise<void> {
     if (!this.conversations) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -311,6 +482,24 @@ export class IngressGateway {
       console.warn('[gateway] conversation list failed:', err);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'failed to load conversations' }));
+    }
+  }
+
+  /** Serve `GET /daily-reports` from the chronicle log (history-on-load). */
+  private async serveDailyReports(res: ServerResponse): Promise<void> {
+    if (!this.dailyReports) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'daily report log unavailable' }));
+      return;
+    }
+    try {
+      const reports = await this.dailyReports.list();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(reports));
+    } catch (err) {
+      console.warn('[gateway] daily reports failed:', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'failed to load daily reports' }));
     }
   }
 
@@ -337,9 +526,59 @@ export class IngressGateway {
 
   private handleWorldEvent(event: WorldEvent): void {
     switch (event.type) {
+      case 'world.needs_setup': {
+        const { canAuto, defaultStyle, maxVillagers, defaultVillagers, defaultSize } = event.payload;
+        this.lastNeedsSetup = {
+          kind: 'world.needs_setup',
+          canAuto,
+          defaultStyle,
+          maxVillagers,
+          defaultVillagers,
+          defaultSize,
+        };
+        this.broadcast(this.lastNeedsSetup);
+        return;
+      }
+      case 'world.style_preview': {
+        const { requestId, theme, palette } = event.payload;
+        // Live colour swatch for the setup screen; not cached (request/response).
+        this.broadcast({ kind: 'world.style_preview', requestId, theme, palette });
+        return;
+      }
+      case 'world.generating': {
+        const { phase, label, step, total, done } = event.payload;
+        this.lastGenerating = {
+          kind: 'world.generating',
+          phase,
+          label,
+          ...(step !== undefined ? { step } : {}),
+          ...(total !== undefined ? { total } : {}),
+          ...(done ? { done } : {}),
+        };
+        // The build has started: the setup prompt is answered, so a late joiner
+        // should see the overlay, not the form.
+        this.lastNeedsSetup = null;
+        this.broadcast(this.lastGenerating);
+        return;
+      }
       case 'world.init': {
-        const { width, height, tickRate, trees, buildings, weather } = event.payload;
-        this.lastInit = { kind: 'world.init', width, height, tickRate, trees, buildings, weather };
+        const { width, height, tickRate, trees, buildings, weather, theme, setting, palette } = event.payload;
+        this.lastInit = {
+          kind: 'world.init',
+          width,
+          height,
+          tickRate,
+          trees,
+          buildings,
+          weather,
+          ...(theme ? { theme } : {}),
+          ...(setting ? { setting } : {}),
+          ...(palette ? { palette } : {}),
+        };
+        // The world now exists: a later-connecting browser must not see a stale
+        // "generating" overlay or setup prompt, so drop both.
+        this.lastGenerating = null;
+        this.lastNeedsSetup = null;
         this.broadcast(this.lastInit);
         return;
       }
@@ -372,12 +611,26 @@ export class IngressGateway {
       // Warm cache: hand the newcomer the world immediately.
       this.send(socket, this.lastInit);
       if (this.lastState) this.send(socket, this.lastState);
+    } else if (this.lastGenerating) {
+      // The village is still being generated: show the newcomer the loading overlay
+      // straight away, rather than asking for a world that doesn't exist yet.
+      this.send(socket, this.lastGenerating);
+    } else if (this.lastNeedsSetup) {
+      // The backend is waiting for the first-run setup choice: show the newcomer the
+      // setup screen at once.
+      this.send(socket, this.lastNeedsSetup);
     } else {
       // Cold cache (we started after the engine): ask the engine to replay.
       this.bus.publish(EXCHANGES.userCommands, makeEvent('user.sync', {}));
     }
     // The current logical tick, so the debug window isn't blank until the next round.
     if (this.lastSimTick) this.send(socket, this.lastSimTick);
+    // The current reasoning-effort config, so the Settings window opens in sync.
+    if (this.lastEffort) this.send(socket, this.lastEffort);
+    // The current chat-model config, so the model picker opens already populated.
+    if (this.lastModel) this.send(socket, this.lastModel);
+    // The current pool shape, so the LLM-engine window shows endpoints immediately.
+    if (this.lastPool) this.send(socket, this.lastPool);
 
     socket.on('message', (raw) => this.handleMessage(raw.toString()));
     socket.on('close', () => console.log('[gateway] browser disconnected'));
@@ -454,6 +707,59 @@ export class IngressGateway {
       case 'god_smite': {
         this.bus.publish(EXCHANGES.userCommands, makeEvent('user.smite', { villagerId: command.targetId }));
         this.broadcast({ kind: 'supervisor.action', action: 'smite', summary: `you smote ${this.villagerName(command.targetId)}` });
+        return;
+      }
+      case 'set_reasoning_effort': {
+        // A Settings-window config change — a multi-word `user.config.*` key the
+        // engine's one-word `user.*` binding skips; only the backend handles it (and
+        // then re-broadcasts the new config for every tab to mirror).
+        const { purpose, level } = command;
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.config.set_reasoning_effort', { purpose, level }),
+        );
+        return;
+      }
+      case 'set_llm_model': {
+        // Same `user.config.*` control channel as effort: the backend switches the
+        // engine's model, persists it, and re-broadcasts the live config.
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.config.set_llm_model', { model: command.model }),
+        );
+        return;
+      }
+      case 'refresh_llm_models': {
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.config.refresh_llm_models', {}),
+        );
+        return;
+      }
+      case 'generate_world': {
+        // First-run setup choice — a `user.config.*` key the backend's boot handler
+        // awaits to build the world the player asked for.
+        const { mode, style, villagers, size } = command;
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.config.generate_world', {
+            mode,
+            ...(style !== undefined ? { style } : {}),
+            ...(villagers !== undefined ? { villagers } : {}),
+            ...(size !== undefined ? { size } : {}),
+          }),
+        );
+        return;
+      }
+      case 'preview_style': {
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.config.preview_style', { requestId: command.requestId, style: command.style }),
+        );
+        return;
+      }
+      case 'reset_world': {
+        this.bus.publish(EXCHANGES.userCommands, makeEvent('user.config.reset_world', {}));
         return;
       }
     }
@@ -550,6 +856,38 @@ export class IngressGateway {
       typeof obj.y === 'number'
     ) {
       return { command: 'god_spawn', entityType: obj.entityType, x: obj.x, y: obj.y };
+    }
+    if (
+      obj.command === 'set_reasoning_effort' &&
+      isEffortPurpose(obj.purpose) &&
+      isReasoningEffort(obj.level)
+    ) {
+      return { command: 'set_reasoning_effort', purpose: obj.purpose, level: obj.level };
+    }
+    if (obj.command === 'set_llm_model' && typeof obj.model === 'string' && obj.model.length > 0) {
+      return { command: 'set_llm_model', model: obj.model };
+    }
+    if (obj.command === 'refresh_llm_models') {
+      return { command: 'refresh_llm_models' };
+    }
+    if (obj.command === 'generate_world' && (obj.mode === 'auto' || obj.mode === 'static')) {
+      return {
+        command: 'generate_world',
+        mode: obj.mode,
+        ...(typeof obj.style === 'string' ? { style: obj.style } : {}),
+        ...(typeof obj.villagers === 'number' ? { villagers: obj.villagers } : {}),
+        ...(obj.size === 'small' || obj.size === 'medium' || obj.size === 'large' ? { size: obj.size } : {}),
+      };
+    }
+    if (
+      obj.command === 'preview_style' &&
+      typeof obj.requestId === 'number' &&
+      typeof obj.style === 'string'
+    ) {
+      return { command: 'preview_style', requestId: obj.requestId, style: obj.style };
+    }
+    if (obj.command === 'reset_world') {
+      return { command: 'reset_world' };
     }
     return null;
   }

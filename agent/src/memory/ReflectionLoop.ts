@@ -31,6 +31,17 @@ export interface ReflectionLoopOptions {
    * are listed in the prompt and used to resolve the reflection's RELATION lines.
    */
   knownPeople?: () => KnownPerson[];
+  /**
+   * The last day already reflected on, restored from persistence, so a reboot
+   * during the night doesn't trigger a duplicate reflection for the current day.
+   * Absent (or -1) means "never reflected".
+   */
+  initialReflectedDay?: number;
+  /**
+   * Called when the loop advances to a new reflected day, so the caller can
+   * persist the watermark and survive the next restart.
+   */
+  onReflectedDay?: (day: number) => void;
 }
 
 /**
@@ -40,14 +51,17 @@ export interface ReflectionLoopOptions {
  */
 export class ReflectionLoop {
   /** The last day number we have already reflected on (-1 = none yet). */
-  private lastReflectedDay = -1;
+  private lastReflectedDay: number;
   /** Guards against overlapping night-thinks if one runs long. */
   private reflecting = false;
 
   constructor(
     private readonly stream: MemoryStream,
     private readonly options: ReflectionLoopOptions,
-  ) {}
+  ) {
+    // Resume the watermark from persistence so a reboot mid-night doesn't re-reflect.
+    this.lastReflectedDay = options.initialReflectedDay ?? -1;
+  }
 
   /**
    * Feed the current simulation tick. Fires a reflection the first time we
@@ -62,6 +76,7 @@ export class ReflectionLoop {
     const day = clock.dayNumber(tick);
     if (day <= this.lastReflectedDay) return; // already slept on this day
     this.lastReflectedDay = day;
+    this.options.onReflectedDay?.(day); // persist the watermark for the next reboot
 
     // Fire-and-forget: never block the caller's tick handler on the LLM.
     void this.runReflection(tick);

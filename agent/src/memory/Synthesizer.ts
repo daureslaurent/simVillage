@@ -16,7 +16,7 @@
  * ---------------------------------------------------------------------------
  */
 
-import type { LlmCallPurpose } from '../../../shared/types';
+import type { LlmCallPurpose, LlmRouteHint } from '../../../shared/types';
 
 /** A request for a single free-text completion. */
 export interface SynthesisRequest {
@@ -32,6 +32,15 @@ export interface SynthesisRequest {
    * window needs this to tell them apart.
    */
   purpose: Extract<LlmCallPurpose, 'reflect' | 'plan'>;
+  /** Optional pool routing (endpoint/model) for the completion. See {@link LlmRouteHint}. */
+  route?: LlmRouteHint;
+  /**
+   * Optional cap on the completion length (tokens), overriding the synthesizer's
+   * default. Raise it for a big structured answer on a THINKING model, which spends
+   * tokens reasoning before it writes — too tight a cap and it never reaches the
+   * actual output (world generation asks for a large JSON, so it bumps this).
+   */
+  maxTokens?: number;
 }
 
 /** A swappable text generator used only by the reflection loop. */

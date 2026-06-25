@@ -21,11 +21,29 @@ import { ConversationsPanel } from './ConversationsPanel';
 import { DebugPanel } from './DebugPanel';
 import { SupervisorPanel } from './SupervisorPanel';
 import { LlmEnginePanel } from './LlmEnginePanel';
+import { LiveLlmPanel } from './LiveLlmPanel';
 import { RelationshipsPanel, type VillagerBook } from './RelationshipsPanel';
 import { GroupActivitiesPanel } from './GroupActivitiesPanel';
+import { AgendaPanel } from './AgendaPanel';
 import { PrayersPanel } from './PrayersPanel';
-import { simTimeFromTick, formatSimTimeOfDay } from '../../shared/simClock';
-import type { BuildingEvent, Conversation, GroupPlan, VillagerActionRecord } from '../../shared/types';
+import { SummaryPanel } from './SummaryPanel';
+import { SettingsPanel } from './SettingsPanel';
+import { EnvironmentHud } from './EnvironmentHud';
+import { GenerationOverlay } from './GenerationOverlay';
+import { SetupScreen } from './SetupScreen';
+import type {
+  AgendaItem,
+  BuildingEvent,
+  Conversation,
+  GroupPlan,
+  SupervisorDailyReportPayload,
+  VillagerActionRecord,
+  VillagerMemory,
+  VillagerPersona,
+} from '../../shared/types';
+
+// Stamp the version badge in the topbar.
+(document.getElementById('app-version') as HTMLElement).textContent = `v${__APP_VERSION__}`;
 
 // The WS endpoint is injected at build time (docker-compose), with a sensible
 // localhost fallback for running the client outside Docker.
@@ -41,6 +59,19 @@ async function fetchActions(villagerId: string): Promise<VillagerActionRecord[]>
   const res = await fetch(`${API_URL}/villagers/${encodeURIComponent(villagerId)}/actions`);
   if (!res.ok) throw new Error(`history fetch failed: ${res.status}`);
   return (await res.json()) as VillagerActionRecord[];
+}
+
+async function fetchPersona(villagerId: string): Promise<VillagerPersona | null> {
+  const res = await fetch(`${API_URL}/villagers/${encodeURIComponent(villagerId)}/persona`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`persona fetch failed: ${res.status}`);
+  return (await res.json()) as VillagerPersona;
+}
+
+async function fetchMemories(villagerId: string): Promise<VillagerMemory[]> {
+  const res = await fetch(`${API_URL}/villagers/${encodeURIComponent(villagerId)}/memories`);
+  if (!res.ok) throw new Error(`memories fetch failed: ${res.status}`);
+  return (await res.json()) as VillagerMemory[];
 }
 
 async function fetchConversations(): Promise<Conversation[]> {
@@ -65,6 +96,18 @@ async function fetchGroupPlans(): Promise<GroupPlan[]> {
   const res = await fetch(`${API_URL}/group-plans`);
   if (!res.ok) throw new Error(`group plans fetch failed: ${res.status}`);
   return (await res.json()) as GroupPlan[];
+}
+
+async function fetchDailyReports(): Promise<SupervisorDailyReportPayload[]> {
+  const res = await fetch(`${API_URL}/daily-reports`);
+  if (!res.ok) throw new Error(`daily reports fetch failed: ${res.status}`);
+  return (await res.json()) as SupervisorDailyReportPayload[];
+}
+
+async function fetchAgenda(): Promise<AgendaItem[]> {
+  const res = await fetch(`${API_URL}/agenda`);
+  if (!res.ok) throw new Error(`agenda fetch failed: ${res.status}`);
+  return (await res.json()) as AgendaItem[];
 }
 
 const canvas = document.getElementById('viewport');
@@ -103,7 +146,7 @@ function mount<T>(make: (host: HTMLElement) => T, spec: WindowSpec): { panel: T;
 
 // The left-dock roster: one card per villager, click-through to its action log.
 const roster = mount(
-  (host) => new RosterPanel(host, { onFetchActions: fetchActions }),
+  (host) => new RosterPanel(host, { onFetchActions: fetchActions, onFetchMemories: fetchMemories, onFetchPersona: fetchPersona }),
   { id: 'roster', title: 'Villagers', icon: '👥', x: 12, y: 56, w: 300, h: colH, minW: 240 },
 ).panel;
 
@@ -129,8 +172,9 @@ const vlifeHost = document.createElement('div');
 vlifeHost.className = 'village-life';
 const relHost = document.createElement('div');
 const grpHost = document.createElement('div');
+const agendaHost = document.createElement('div');
 const prayHost = document.createElement('div');
-vlifeHost.append(relHost, grpHost, prayHost);
+vlifeHost.append(relHost, grpHost, agendaHost, prayHost);
 
 const relationships = new RelationshipsPanel(relHost, {
   onFetch: fetchRelationships,
@@ -140,6 +184,16 @@ net.onRelationship = (message) => relationships.ingest(message);
 
 const groupActivities = new GroupActivitiesPanel(grpHost, { onFetch: fetchGroupPlans });
 net.onGroupPlan = (message) => groupActivities.ingest(message);
+
+// The Agenda card: every villager's notes + scheduled events, as a village-wide
+// timeline or broken out per villager. Seeded from /agenda, live via agenda.updated.
+const agenda = new AgendaPanel(agendaHost, {
+  onFetch: fetchAgenda,
+  colorOf: (id) => net.getState().villagers.find((v) => v.id === id)?.color,
+  getTick: () => net.getState().tick,
+});
+net.onAgendaUpdate = (item) => agenda.ingest(item);
+net.onAgendaRemoved = (itemId) => agenda.remove(itemId);
 
 const prayers = new PrayersPanel(prayHost);
 
@@ -184,6 +238,38 @@ net.onPrayer = (prayer) => {
 };
 net.onSupervisorAction = (action) => supervisor.ingestAction(action);
 
+// The Chronicle window — the god's beautiful end-of-day summary. It pops to the
+// front each time a new day's chronicle arrives, and keeps the whole run's
+// history (seeded from GET /daily-reports) revisitable via its day selector.
+const summaryMount = mount(
+  (host) => new SummaryPanel(host),
+  {
+    id: 'chronicle',
+    title: 'Chronicle',
+    icon: '📜',
+    x: Math.max(120, Math.floor(W / 2) - 320),
+    y: Math.max(80, Math.floor(H / 2) - 220),
+    w: 640,
+    h: 440,
+    minW: 460,
+    minH: 300,
+    closable: true,
+    startHidden: true,
+  },
+);
+const summary = summaryMount.panel;
+net.onDailyReport = (message) => {
+  const isNewLatest = summary.ingest(message.report);
+  // Auto-popup only when a genuinely new day arrives (not on a late re-broadcast).
+  if (isNewLatest) summaryMount.win.open();
+};
+// Seed the history on load; show the latest without stealing focus on first paint.
+void fetchDailyReports()
+  .then((reports) => {
+    if (reports.length > 0) summary.loadHistory(reports);
+  })
+  .catch((err) => console.warn('[chronicle] history fetch failed:', err));
+
 // The LLM-engine debug window: what's running on the shared engine right now,
 // and the latency / result of recent round-trips. Diagnoses skipped turns.
 const llmPanel = mount(
@@ -192,14 +278,58 @@ const llmPanel = mount(
 ).panel;
 // The engine LLM stream feeds the debug panel AND the renderer, which pulses the
 // sense disc of whichever villager is currently running its mind.
+// The Live LLM window: watch each `/decide` call think and answer token-by-token,
+// then collapse into an Input · Think · Output · Tool card (last 10 kept).
+const liveLlm = mount(
+  (host) => new LiveLlmPanel(host),
+  { id: 'live-llm', title: 'Live LLM', icon: '🔮', x: Math.max(20, Math.floor(W / 2) - 280), y: Math.max(60, H - 460), w: 460, h: 400, minW: 340, minH: 260 },
+).panel;
 net.onEngineCallStarted = (call) => {
   renderer.noteEngineCallStarted(call);
   llmPanel.ingestStart(call);
+  liveLlm.ingestStart(call);
 };
+net.onEngineCallDelta = (call) => {
+  liveLlm.ingestDelta(call);
+  llmPanel.ingestDelta(call); // accumulate think text for the engine's reasoning badge
+};
+net.onLlmPool = (cfg) => llmPanel.setPool(cfg);
 net.onEngineCallFinished = (call) => {
   renderer.noteEngineCallFinished(call);
   llmPanel.ingestFinish(call);
+  liveLlm.ingestFinish(call);
 };
+
+// The Settings window: operator controls for the LLM engine — today, the
+// per-purpose reasoning effort. Opened from its ⚙️ dock chip; the backend owns
+// the truth, so the controls mirror whatever the server last broadcast.
+const settings = mount(
+  (host) =>
+    new SettingsPanel(host, {
+      onSetEffort: (purpose, level) => net.setReasoningEffort(purpose, level),
+      onSetModel: (model) => net.setLlmModel(model),
+      onRefreshModels: () => net.refreshLlmModels(),
+      onResetWorld: () => net.resetWorld(),
+    }),
+  {
+    id: 'settings',
+    title: 'Settings',
+    icon: '⚙️',
+    x: Math.max(120, Math.floor(W / 2) - 220),
+    y: Math.max(80, Math.floor(H / 2) - 260),
+    w: 400,
+    h: 560,
+    minW: 340,
+    minH: 320,
+    closable: true,
+    startHidden: true,
+  },
+).panel;
+net.onReasoningEffort = (cfg) => {
+  settings.setSettings(cfg);
+  llmPanel.setEffort(cfg); // tag each engine-call row with its purpose's effort
+};
+net.onLlmModel = (cfg) => settings.setModelConfig(cfg);
 
 // Final Phase — the "Inception" inspector. Clicking a villager opens this window;
 // it streams that villager's thoughts and whispers ideas back.
@@ -231,6 +361,8 @@ const buildingMount = mount(
     new BuildingInspectorPanel(host, {
       onFetch: fetchBuildingLog,
       getBuilding: (id) => net.getState().buildings.find((b) => b.id === id) ?? null,
+      getCarts: () => net.getState().carts,
+      onFocusCart: (id) => renderer.focusCart(id),
     }),
   {
     id: 'building-inspector',
@@ -276,19 +408,46 @@ net.onThought = (thought) => {
   convos.ingestThought(thought);
 };
 
-// The in-world clock in the top app bar: turns the engine tick into a simulated
-// date & time (one tick = 10 sim-seconds).
+// The environment HUD in the top app bar: season · weather · temperature · time,
+// all DERIVED from the engine tick + current weather (see EnvironmentHud).
 const clockEl = document.getElementById('clock');
 if (clockEl) {
-  net.onClock = (tick) => {
-    const t = simTimeFromTick(tick);
-    clockEl.hidden = false;
-    clockEl.innerHTML =
-      `<span class="clock__day">Day ${t.day}</span>` +
-      `<span class="clock__time">${formatSimTimeOfDay(tick)}</span>` +
-      `<span class="clock__part">${t.partOfDay}</span>`;
+  const envHud = new EnvironmentHud(clockEl);
+  net.onClock = (tick) => envHud.render(tick);
+  // Weather changes the temperature too, so re-render the whole HUD on it.
+  const priorOnWeather = net.onWeather;
+  net.onWeather = (weather) => {
+    priorOnWeather?.(weather);
+    envHud.setWeather(weather);
   };
+  // An LLM-generated village announces its theme on world.init; show it in the HUD.
+  net.onTheme = (theme, setting) => envHud.setTheme(theme, setting);
 }
+
+// The first-run flow: the SETUP screen (no world yet) → the loading OVERLAY (build
+// in progress) → the live world. The backend signals each transition, so the client
+// just shows/hides these two full-screen surfaces in response.
+const genOverlayEl = document.getElementById('gen-overlay');
+const overlay = genOverlayEl ? new GenerationOverlay(genOverlayEl) : null;
+
+const setupEl = document.getElementById('setup-screen');
+const setup = setupEl
+  ? new SetupScreen(setupEl, {
+      onGenerate: (opts) => net.generateWorld(opts),
+      onPreview: (requestId, style) => net.previewStyle(requestId, style),
+    })
+  : null;
+
+net.onNeedsSetup = (msg) => setup?.show(msg);
+net.onStylePreview = (msg) => setup?.applyPreview(msg);
+net.onGenerating = (msg) => {
+  setup?.hide(); // the build has begun; replace the form with the progress overlay
+  overlay?.update(msg);
+};
+net.onWorldInit = () => {
+  setup?.hide();
+  overlay?.hide();
+};
 
 // Top-bar "reset layout" tidies every window back to its default place.
 document.getElementById('reset-layout')?.addEventListener('click', () => wm.resetLayout());

@@ -38,12 +38,14 @@ import type {
   ResourceKind,
   Tree,
   Vec2,
+  TerrainPalette,
   WeatherKind,
   WorldInitMessage,
   WorldSeed,
   WorldStateUpdate,
 } from '../../shared/types';
 import { BACKPACK_CAPACITY } from '../../shared/types';
+import { deriveAppearance } from '../../shared/appearance';
 import {
   AMBIENCE_RADIUS,
   BUILDING_CAPACITY,
@@ -51,7 +53,7 @@ import {
   BUILDING_FUNCTIONS,
   cartSpecFor,
   NEED_RESOURCE,
-  CONSUME_INTERVAL_TICKS,
+  CONSUME_INTERVAL_ROUNDS,
   NEED_RELIEF_PER_UNIT,
   NEED_CONSUME_THRESHOLD,
   PASSIVE_CONVERT_RATE,
@@ -62,6 +64,7 @@ import {
   buildingConversion,
   buildingStockKinds,
   isConstructionSite,
+  isDepot,
   isConverter,
   isWorkable,
   sourceResource,
@@ -78,18 +81,30 @@ const SPAWN_VILLAGER_COLORS = ['#ff8c00', '#00ced1', '#ff69b4', '#7fff00', '#ba5
 // than seconds, and so a short visit to the right building clearly reverses them.
 // ---------------------------------------------------------------------------
 
-/** How fast hunger and thirst creep up every tick. */
-const HUNGER_RATE = 0.04;
-const THIRST_RATE = 0.06;
+// ---------------------------------------------------------------------------
+// All the RATES below are PER IN-WORLD ROUND (one coordinator tick of the clock),
+// NOT per physics frame. The engine's physics loop runs many times a second to
+// keep bodies MOVING smoothly, but needs, consumption, production and the like
+// only advance when the in-world clock advances (see `update`). That ties them to
+// simulated time — a slow round waiting on the LLM no longer ages the village —
+// and lets the day be balanced as ~480 rounds (24h): a villager wakes rested at
+// dawn, hungers/thirsts/tires over the day, and turns in by evening.
+// ---------------------------------------------------------------------------
+
+/** How fast hunger and thirst creep up each in-world round. */
+const HUNGER_RATE = 0.18;
+const THIRST_RATE = 0.25;
 /**
  * Fatigue is the villager's POWER, spent by being awake. It grows faster while
  * walking and slower while idle, but it always grows: staying awake costs power.
  * The ONLY way to pay it back is to SLEEP (see {@link WorldEngine.stepSleep}) — a
  * tired villager sleeps at a house, and one that runs all the way out collapses
  * into a forced sleep where it stands. No building passively rests you any more.
+ * Tuned so a villager active through the ~280-round waking day reaches the
+ * {@link HOUSE_SLEEP_THRESHOLD} by evening.
  */
-const FATIGUE_MOVE_RATE = 0.05;
-const FATIGUE_IDLE_RATE = 0.02;
+const FATIGUE_MOVE_RATE = 0.3;
+const FATIGUE_IDLE_RATE = 0.2;
 
 /**
  * Fatigue at which a TIRED villager turns in for the night, when it is idle at
@@ -101,19 +116,25 @@ const HOUSE_SLEEP_THRESHOLD = 70;
 /** Fatigue (0..100) at which a villager runs out of power and collapses anywhere. */
 const FATIGUE_SLEEP_THRESHOLD = 100;
 /**
- * A full night's sleep, in coordinator ROUNDS (the in-world clock's unit): about
- * 7 in-world hours. The clock advances one round at a time, so a sleeper wakes
- * after this many rounds have elapsed regardless of how long each took in real time.
+ * In-world ROUNDS in a full day (~480 at the default 180s/tick). The epoch is
+ * 06:00, so dawn falls on exact multiples of this — the boundary a sleeper wakes
+ * on (see {@link WorldEngine.fallAsleep}) and the daily clock rolls over.
  */
-const SLEEP_ROUNDS = Math.round((7 * 3600) / SIM_SECONDS_PER_TICK);
-/** How fast boredom creeps up every tick — the daily dullness that pulls a villager toward company and the tavern. */
-const BOREDOM_RATE = 0.03;
+const ROUNDS_PER_DAY = Math.round((24 * 3600) / SIM_SECONDS_PER_TICK);
 /**
- * How much boredom eases per tick while a villager stands in a GATHERING (company).
- * A gentle, free relief so socializing has a payoff — and so that, once boredom is
- * low, the urge to keep chatting fades on its own (a natural brake on idle talk).
+ * The least a villager sleeps, in rounds (~2h), so one who collapses just before
+ * dawn still gets a real rest instead of snapping awake a few minutes later. A
+ * normal evening sleeper instead sleeps right through to the next dawn.
  */
-const GATHERING_BOREDOM_RELIEF = 0.4;
+const MIN_SLEEP_ROUNDS = Math.round((2 * 3600) / SIM_SECONDS_PER_TICK);
+/** How fast boredom creeps up each in-world round — the daily dullness that pulls a villager toward company and the tavern. */
+const BOREDOM_RATE = 0.13;
+/**
+ * How much boredom eases each round while a villager stands in a GATHERING (company).
+ * Outpaces the per-round creep, so socializing has a payoff — and so that, once
+ * boredom is low, the urge to keep chatting fades on its own (a brake on idle talk).
+ */
+const GATHERING_BOREDOM_RELIEF = 1.0;
 
 /**
  * How many clock ticks (rounds) a refused-work status NOTICE lingers before it
@@ -132,8 +153,8 @@ const MAX_CONSTRUCTION_SITES = 3;
 // ---------------------------------------------------------------------------
 // Environment mechanics — the WEATHER and the DAY/NIGHT cycle are not just
 // ambient any more: they bend the simulation. Each weather carries a set of
-// MULTIPLIERS on the core rates, plus a small per-tick `rainFill` of water into
-// the village's cisterns (rain and storms top up the stores the crops drink).
+// MULTIPLIERS on the core rates, plus a per-round `rainFill` of water into the
+// village's cisterns (rain and storms top up the stores the crops drink).
 // ---------------------------------------------------------------------------
 
 interface WeatherEffect {
@@ -143,14 +164,14 @@ interface WeatherEffect {
   fatigue: number;
   /** Multiplier on thirst accrual (cool rain slows it; a heatwave drives it up). */
   thirst: number;
-  /** Units of water rained into each water-stocking building per tick (0 = none). */
+  /** Units of water rained into each water-stocking building per round (0 = none). */
   rainFill: number;
 }
 
 const WEATHER_EFFECTS: Record<WeatherKind, WeatherEffect> = {
   clear: { crop: 1, fatigue: 1, thirst: 1, rainFill: 0 },
-  rain: { crop: 1.6, fatigue: 1, thirst: 0.6, rainFill: 0.05 },
-  storm: { crop: 1.8, fatigue: 1.5, thirst: 0.6, rainFill: 0.09 },
+  rain: { crop: 1.6, fatigue: 1, thirst: 0.6, rainFill: 0.4 },
+  storm: { crop: 1.8, fatigue: 1.5, thirst: 0.6, rainFill: 0.8 },
   fog: { crop: 0.8, fatigue: 1.1, thirst: 1, rainFill: 0 },
   heatwave: { crop: 0.7, fatigue: 1.3, thirst: 1.8, rainFill: 0 },
 };
@@ -232,11 +253,24 @@ export class WorldEngine {
   private readonly staticOccupancy: Uint8Array;
 
   /**
-   * Monotonic PHYSICS tick counter since `start()`. Drives the real-time mechanics
-   * that must keep running smoothly between rounds — body movement, needs creep,
-   * production, the eat/drink cadence. NOT the in-world clock (see `clockTick`).
+   * Monotonic PHYSICS tick counter since `start()`. Drives the ONLY thing that must
+   * stay smooth between rounds — body MOVEMENT. The rate-based mechanics (needs
+   * creep, production, the eat/drink cadence) no longer ride this; they advance with
+   * the in-world clock instead (see `lastEconomyTick`). NOT the clock (see `clockTick`).
    */
   private tickCount = 0;
+
+  /**
+   * The in-world round the rate-based simulation (needs, production, consumption,
+   * conversion, cart hauling) was last advanced on. Each physics frame compares it
+   * to {@link clockTick}: economy steps run ONCE when the clock has moved on, so they
+   * follow simulated time rather than real time — a round stalled on the LLM ages the
+   * village by nothing. -1 until the first round; movement runs every frame regardless.
+   */
+  private lastEconomyTick = -1;
+
+  /** Monotonic count of in-world ROUNDS advanced — drives the eat/drink cadence. */
+  private roundCount = 0;
 
   /**
    * The in-world CLOCK tick — the turn coordinator's logical round, pushed in via
@@ -275,6 +309,16 @@ export class WorldEngine {
   /** Current village-wide weather, set by the God Agent. Broadcast to observers. */
   private weather: WeatherKind = 'clear';
 
+  /**
+   * Flavour of an LLM-generated village (theme label + a sentence), carried from
+   * the seed into `world.init` so the browser can show what kind of place this is.
+   * Empty for the classic hand-authored village.
+   */
+  private readonly theme: string;
+  private readonly setting: string;
+  /** Themed ground colours, carried from the seed into world.init (undefined = old save). */
+  private readonly palette: TerrainPalette | undefined;
+
   /** Monotonic counter for God-spawned entity ids, so they never collide. */
   private spawnSeq = 0;
 
@@ -292,6 +336,9 @@ export class WorldEngine {
     this.width = seed.width;
     this.height = seed.height;
     this.tickRate = options.tickRate ?? 10;
+    this.theme = seed.theme ?? '';
+    this.setting = seed.setting ?? '';
+    this.palette = seed.palette;
     this.staticOccupancy = new Uint8Array(this.width * this.height);
 
     // Load the seed into live state. Clone positions so external seed objects
@@ -307,6 +354,10 @@ export class WorldEngine {
       this.entities.set(building.id, this.normaliseBuilding(building));
       this.markStaticRect(building.position.x, building.position.y, building.width, building.height);
     }
+    // Heal worlds saved before the technical depot existed: every village needs one
+    // (it is where the cart fleet is dispatched from), so mint one on free ground near
+    // the centre when a loaded world has none. Fresh seeds already include a depot.
+    this.ensureDepot();
     for (const villager of seed.villagers) {
       this.entities.set(villager.id, this.normaliseVillager(villager));
     }
@@ -314,6 +365,30 @@ export class WorldEngine {
     // their standing orders so a restart keeps the logistics running.
     for (const cart of seed.carts ?? []) {
       this.entities.set(cart.id, this.normaliseCart(cart));
+    }
+
+    // Rehydrate the engine's TRANSIENT state from the snapshot, so a restart
+    // resumes weather, sleepers, work sessions, status notices, and the spawn
+    // counter rather than starting clean. All optional (absent in fresh/old seeds).
+    this.restoreTransient(seed);
+  }
+
+  /**
+   * Reload the live transient maps + scalars from a persisted {@link WorldSeed}.
+   * Each field is optional — a freshly generated or pre-persistence seed simply
+   * leaves the corresponding state at its empty default.
+   */
+  private restoreTransient(seed: WorldSeed): void {
+    if (seed.weather) this.weather = seed.weather;
+    if (typeof seed.spawnSeq === 'number') this.spawnSeq = seed.spawnSeq;
+    for (const s of seed.sleepUntil ?? []) {
+      this.sleepUntil.set(s.villagerId, { from: s.from, until: s.until, fatigue0: s.fatigue0 });
+    }
+    for (const w of seed.workSession ?? []) {
+      this.workSession.set(w.villagerId, { inputUsed: w.inputUsed });
+    }
+    for (const n of seed.notices ?? []) {
+      this.notices.set(n.villagerId, { text: n.text, untilTick: n.untilTick });
     }
   }
 
@@ -407,18 +482,34 @@ export class WorldEngine {
   // The simulation step
   // -------------------------------------------------------------------------
 
-  /** Advance the world by exactly one tick and broadcast the new state. */
+  /**
+   * Advance the world by exactly one physics tick and broadcast the new state.
+   *
+   * Two clocks run here. MOVEMENT (bodies walking, carts driving) is stepped every
+   * physics frame so it stays smooth. The RATE-BASED economy (needs, production,
+   * consumption, conversion, cart load/unload) is stepped only when the in-world
+   * clock has advanced since we last ran it — so it follows simulated time, not the
+   * wall clock, and a round stalled on the LLM ages the village by nothing.
+   */
   private update(): void {
-    // The environment this tick: the active weather's multipliers, and whether the
+    // A fresh in-world ROUND has begun when the clock has moved past where the
+    // economy last ran. Everything rate-based is gated on this; movement is not.
+    const newRound = this.clockTick > this.lastEconomyTick;
+    if (newRound) {
+      this.lastEconomyTick = this.clockTick;
+      this.roundCount += 1;
+    }
+
+    // The environment this round: the active weather's multipliers, and whether the
     // sun is down (night drains power faster). Computed once for the whole tick.
     const effect = WEATHER_EFFECTS[this.weather];
     const night = simTimeFromTick(this.clockTick).partOfDay === 'night';
     const fatigueMult = effect.fatigue * (night ? NIGHT_FATIGUE_MULTIPLIER : 1);
 
     // The sources refill, the converters turn input→output (crops grow faster in
-    // the rain), and rain/storms trickle water into the cisterns.
-    for (const building of this.buildings()) this.stepProduction(building, effect);
-    // Who is in company this tick — drives the small free boredom relief of being
+    // the rain), and rain/storms trickle water into the cisterns — once per round.
+    if (newRound) for (const building of this.buildings()) this.stepProduction(building, effect);
+    // Who is in company this round — drives the small free boredom relief of being
     // among neighbours. Computed once for the whole tick rather than per villager.
     const villagers = this.villagers();
     const gathered = new Set<string>();
@@ -427,13 +518,13 @@ export class WorldEngine {
       // A villager with no power left sleeps: the body lies still and the mind goes
       // dark (the coordinator stops granting it turns). Skip its normal stepping.
       if (this.stepSleep(villager)) continue;
-      this.stepTask(villager); // may steer movement / work a building this tick
+      this.stepTask(villager, newRound); // navigate every frame; convert once per round
       this.stepVillager(villager);
-      this.stepNeeds(villager, gathered.has(villager.id), fatigueMult, effect.thirst);
+      this.stepNeeds(villager, gathered.has(villager.id), fatigueMult, effect.thirst, newRound);
     }
-    // Carts run their standing orders on their own, every physics tick — they keep
-    // hauling even while minds wait on the LLM between rounds.
-    for (const cart of this.carts()) this.stepCart(cart);
+    // Carts run their standing orders on their own: they DRIVE every physics tick so
+    // hauling stays smooth, but only load/unload (mutate stock) once per round.
+    for (const cart of this.carts()) this.stepCart(cart, newRound);
     this.tickCount += 1;
     this.emit('tick', this.getStateUpdate());
   }
@@ -441,13 +532,15 @@ export class WorldEngine {
   /**
    * Drive one cart one tick of its standing order — the autonomous take→deposit loop.
    * Empty, it heads to the SOURCE and loads its resource; loaded, it heads to the
-   * DEST and unloads; then it repeats. Movement, reach (`SERVICE_REACH`), capacity,
-   * and stock mutation reuse the very same helpers villagers use, so a cart and a
-   * person draw a place dry identically. When it cannot make progress — the source is
-   * empty while it sits empty, or the dest is full while it sits loaded — it WAITS in
-   * place and retries every tick (the order stands until a villager replaces it).
+   * DEST and unloads; then it repeats. It DRIVES every physics tick (smooth movement)
+   * but only LOADS/UNLOADS — moving real stock — once per in-world round, gated by
+   * `accrue`, so hauling throughput follows simulated time like every other rate.
+   * Reach (`SERVICE_REACH`), capacity, and stock mutation reuse the very same helpers
+   * villagers use, so a cart and a person draw a place dry identically. When it cannot
+   * make progress — the source is empty while it sits empty, or the dest is full while
+   * it sits loaded — it WAITS in place and retries (the order stands until replaced).
    */
-  private stepCart(cart: Cart): void {
+  private stepCart(cart: Cart, accrue: boolean): void {
     if (!cart.order) {
       cart.phase = 'idle';
       cart.target = null;
@@ -467,7 +560,7 @@ export class WorldEngine {
     // Empty cart: fetch from the source. Loaded cart: deliver to the destination.
     if (cart.cargo.length === 0) {
       this.driveCart(cart, from);
-      if (this.rectDistance(cart.position, from) <= SERVICE_REACH) {
+      if (accrue && this.rectDistance(cart.position, from) <= SERVICE_REACH) {
         const room = cart.capacity - cart.cargo.length;
         const got = this.drawFromBuilding(from, resource, room);
         for (let i = 0; i < got; i++) cart.cargo.push(resource);
@@ -475,17 +568,25 @@ export class WorldEngine {
           cart.phase = 'waiting';
           cart.waitReason = `${from.name} has no ${resource} to load`;
         } else {
-          cart.waitReason = null; // loaded — delivers from next tick
+          cart.waitReason = null; // loaded — delivers from next round
         }
       }
     } else {
       this.driveCart(cart, to);
-      if (this.rectDistance(cart.position, to) <= SERVICE_REACH) {
-        const gave = this.depositToBuilding(to, resource, cart.cargo.length);
+      if (accrue && this.rectDistance(cart.position, to) <= SERVICE_REACH) {
+        // A cart can deliver into a normal store OR feed a construction site the
+        // material it still needs (finishing it once the last unit is in). Credit the
+        // villager who dispatched the cart as the actor/finisher when still around.
+        const dispatcher = cart.lastCommandedBy ? this.entities.get(cart.lastCommandedBy) : undefined;
+        const actor = dispatcher && dispatcher.type === 'villager' ? dispatcher : undefined;
+        const toSite = isConstructionSite(to.kind);
+        const gave = toSite
+          ? this.addMaterialToSite(to, resource, cart.cargo.length, actor)
+          : this.depositToBuilding(to, resource, cart.cargo.length);
         cart.cargo.splice(0, gave);
         if (gave <= 0) {
           cart.phase = 'waiting';
-          cart.waitReason = `${to.name} is full`;
+          cart.waitReason = toSite ? `${to.name} no longer needs ${resource}` : `${to.name} is full`;
         } else {
           cart.waitReason = null;
         }
@@ -513,11 +614,12 @@ export class WorldEngine {
   }
 
   /**
-   * Passive production each tick. The WATER SOURCE is an inexhaustible spring, so
-   * it is simply kept brim-full (villagers can always draw from it). A CONVERTER
-   * (Greenfield) trickles its input into output on its own at the slow passive
-   * rate; a villager working there speeds this up (see {@link stepTask}). Other
-   * buildings (Hall Town storage, temple, houses) produce nothing on their own.
+   * Passive production each round (the caller gates this on a fresh in-world round).
+   * The WATER SOURCE is an inexhaustible spring, so it is simply kept brim-full
+   * (villagers can always draw from it). A CONVERTER (Greenfield) trickles its input
+   * into output on its own at the slow passive rate; a villager working there speeds
+   * this up (see {@link stepTask}). Other buildings (Hall Town storage, temple,
+   * houses) produce nothing on their own.
    */
   private stepProduction(building: Building, effect: WeatherEffect): void {
     const source = sourceResource(building.kind);
@@ -569,15 +671,17 @@ export class WorldEngine {
   }
 
   /**
-   * Drive a villager's standing job (a {@link VillagerTask}) one tick. The only
-   * kind today is `refill`: walk to the target building if not yet beside it, and
-   * once adjacent, stand still and top up its stock a little each tick. The task
-   * clears itself when the building is full, the target is gone, or the villager
-   * has been sent elsewhere (its `target` was changed by a fresh command). This is
-   * the engine half of the "villagers must refill empty buildings" loop — a mind
-   * only has to issue ONE `work_at`; the body sees the chore through.
+   * Drive a villager's standing job (a {@link VillagerTask}). The only kind today is
+   * `refill`: walk to the target building if not yet beside it (NAVIGATION runs every
+   * physics frame so the approach stays smooth), and once adjacent, stand still and
+   * convert its stock — but the conversion (real work) advances only on a fresh
+   * in-world round (`accrue`), so output follows simulated time. The task clears
+   * itself when the building is full, the target is gone, or the villager has been
+   * sent elsewhere (its `target` was changed by a fresh command). This is the engine
+   * half of the "villagers must refill empty buildings" loop — a mind only has to
+   * issue ONE `work_at`; the body sees the chore through.
    */
-  private stepTask(villager: Villager): void {
+  private stepTask(villager: Villager, accrue: boolean): void {
     const task = villager.task;
     if (!task) return;
 
@@ -601,12 +705,14 @@ export class WorldEngine {
       return;
     }
 
-    // Arrived: stop walking and work. Working Greenfield converts its stocked
-    // water into food at the fast hands-on rate (on top of the passive trickle).
-    // The job is done when the food store is full or the water has run out — there
-    // is nothing more to make. (work_at is gated to converters, so there is always
-    // a conversion to run.)
+    // Arrived: stop walking. Work (the conversion) only advances on a fresh round.
     villager.target = null;
+    if (!accrue) return;
+
+    // Working Greenfield converts its stocked water into food at the fast hands-on
+    // rate (on top of the passive trickle). The job is done when the food store is
+    // full or the water has run out — there is nothing more to make. (work_at is
+    // gated to converters, so there is always a conversion to run.)
     const conv = buildingConversion(building.kind);
     if (!conv) {
       villager.task = null;
@@ -620,7 +726,7 @@ export class WorldEngine {
     if (outputFull || inputGone) {
       console.log(`[engine] ${villager.id} finished working ${building.name}`);
       villager.task = null;
-      // Report the session as one tidy line rather than per-tick conversions.
+      // Report the session as one tidy line rather than per-round conversions.
       const used = Math.round(session?.inputUsed ?? 0);
       const note =
         used > 0
@@ -674,9 +780,9 @@ export class WorldEngine {
    * has run out (fatigue at {@link FATIGUE_SLEEP_THRESHOLD}) collapses into sleep
    * where it stands: it drops its target and any chore, and its mind goes dark —
    * the turn coordinator reads `asleep` off the world stream and grants it no LLM
-   * turns. Sleep lasts {@link SLEEP_ROUNDS} clock rounds (~7 in-world hours), over
-   * which its power is restored; at dawn it wakes fully rested. Returns true while
-   * the villager is asleep, so the caller skips its movement/needs stepping.
+   * turns. Sleep runs through the night to DAWN (see {@link fallAsleep}), over which
+   * its power is restored; at dawn it wakes fully rested. Returns true while the
+   * villager is asleep, so the caller skips its movement/needs stepping.
    */
   private stepSleep(villager: Villager): boolean {
     if (villager.asleep) {
@@ -716,19 +822,27 @@ export class WorldEngine {
     return false;
   }
 
-  /** Put a villager to sleep where it stands, scheduling its dawn wake (~7h on). */
+  /**
+   * Put a villager to sleep where it stands, scheduling its wake at the next DAWN —
+   * the village sleeps through the night as one and rises together at 06:00. The
+   * epoch is 06:00, so dawn ticks are exact multiples of {@link ROUNDS_PER_DAY}; we
+   * floor the minimum sleep ({@link MIN_SLEEP_ROUNDS}) so a villager who collapses
+   * just before dawn still gets a real rest rather than waking minutes later.
+   */
   private fallAsleep(villager: Villager, why: string): void {
     villager.asleep = true;
     villager.target = null;
     villager.task = null;
     this.workSession.delete(villager.id);
+    const nextDawn = (Math.floor(this.clockTick / ROUNDS_PER_DAY) + 1) * ROUNDS_PER_DAY;
+    const until = Math.max(nextDawn, this.clockTick + MIN_SLEEP_ROUNDS);
     this.sleepUntil.set(villager.id, {
       from: this.clockTick,
-      until: this.clockTick + SLEEP_ROUNDS,
+      until,
       fatigue0: villager.needs.fatigue,
     });
     villager.status = 'Sleeping';
-    console.log(`[engine] ${villager.id} ${why} and fell asleep (wakes at round ${this.clockTick + SLEEP_ROUNDS})`);
+    console.log(`[engine] ${villager.id} ${why} and fell asleep (wakes at round ${until})`);
   }
 
   /** A house the villager is standing beside (within reach), or null — its bed. */
@@ -741,43 +855,49 @@ export class WorldEngine {
   }
 
   /**
-   * Advance one villager's needs by a tick and refresh its status line. Hunger
-   * and thirst always creep up; fatigue (power) always grows while awake — faster
-   * walking, slower idle — and is only paid back by RESTING at a house or by
-   * SLEEPING once it runs out (see {@link stepSleep}). Hunger and thirst are
-   * relieved by CONSUMING food/water (from the backpack, then Hall Town) — see
-   * {@link stepConsumption}. The status line reports whichever is happening.
+   * Advance one villager's needs and refresh its status line. The need CREEP and the
+   * eat/drink cadence run only on a fresh in-world round (`accrue`), so they follow
+   * simulated time, not the physics loop; the STATUS line is refreshed every frame so
+   * a body that just arrived or finished a chore reads correctly between rounds.
+   *
+   * Hunger and thirst creep up; fatigue (power) grows while awake — faster walking,
+   * slower idle — and is only paid back by SLEEPING (see {@link stepSleep}). Hunger
+   * and thirst are relieved by CONSUMING food/water (backpack, then a stocked
+   * building) — see {@link stepConsumption}.
    */
   private stepNeeds(
     villager: Villager,
     inCompany: boolean,
     fatigueMult: number,
     thirstMult: number,
+    accrue: boolean,
   ): void {
-    const n = villager.needs;
-    n.hunger = clampNeed(n.hunger + HUNGER_RATE);
-    n.thirst = clampNeed(n.thirst + THIRST_RATE * thirstMult);
-    n.fatigue = clampNeed(
-      n.fatigue + (villager.target ? FATIGUE_MOVE_RATE : FATIGUE_IDLE_RATE) * fatigueMult,
-    );
-    n.boredom = clampNeed(n.boredom + BOREDOM_RATE);
+    if (accrue) {
+      const n = villager.needs;
+      n.hunger = clampNeed(n.hunger + HUNGER_RATE);
+      n.thirst = clampNeed(n.thirst + THIRST_RATE * thirstMult);
+      n.fatigue = clampNeed(
+        n.fatigue + (villager.target ? FATIGUE_MOVE_RATE : FATIGUE_IDLE_RATE) * fatigueMult,
+      );
+      n.boredom = clampNeed(n.boredom + BOREDOM_RATE);
 
-    // Being among company eases boredom a little, for free — the simple pleasure of
-    // neighbours. (The tavern eases it faster, by serving goods; see stepConsumption.)
-    if (inCompany) n.boredom = clampNeed(n.boredom - GATHERING_BOREDOM_RELIEF);
+      // Being among company eases boredom a little, for free — the simple pleasure of
+      // neighbours. (The tavern eases it faster, by serving goods; see stepConsumption.)
+      if (inCompany) n.boredom = clampNeed(n.boredom - GATHERING_BOREDOM_RELIEF);
 
-    // A beautiful village is its own quiet pleasure: standing near a villager-raised
-    // adornment (a monument, a lamp) eases boredom too — the payoff for building one.
-    const ambience = this.ambienceNear(villager.position);
-    if (ambience > 0) n.boredom = clampNeed(n.boredom - ambience);
+      // A beautiful village is its own quiet pleasure: standing near a villager-raised
+      // adornment (a monument, a lamp) eases boredom too — the payoff for building one.
+      const ambience = this.ambienceNear(villager.position);
+      if (ambience > 0) n.boredom = clampNeed(n.boredom - ambience);
+
+      // Hunger, thirst & boredom: consume one unit on the consumption cadence.
+      this.stepConsumption(villager);
+    }
 
     // No building passively relieves fatigue any more — power is restored ONLY by
     // sleeping (see stepSleep). We still find a nearby house so the status line can
     // read "Resting at <house>" when a villager idles at home.
     const service = this.serviceBuildingNear(villager.position.x, villager.position.y);
-
-    // Hunger, thirst & boredom: consume one unit on the consumption cadence.
-    this.stepConsumption(villager);
 
     // A live notice (e.g. a refused-work nudge) overrides the derived status so the
     // guidance shows on the map and is read by the mind in its own perceived status.
@@ -787,13 +907,14 @@ export class WorldEngine {
   }
 
   /**
-   * Eating, drinking, and unwinding. Every {@link CONSUME_INTERVAL_TICKS} ticks a
-   * villager consumes ONE unit for each resourced need that has climbed to
-   * {@link NEED_CONSUME_THRESHOLD}. Below that they leave their supplies alone (so
-   * a backpack carried for hauling isn't drained by a low need).
+   * Eating, drinking, and unwinding. Called once per round (gated by the caller);
+   * every {@link CONSUME_INTERVAL_ROUNDS} rounds a villager consumes ONE unit for
+   * each resourced need that has climbed to {@link NEED_CONSUME_THRESHOLD}. Below
+   * that they leave their supplies alone (so a backpack carried for hauling isn't
+   * drained by a low need).
    */
   private stepConsumption(villager: Villager): void {
-    if (this.tickCount % CONSUME_INTERVAL_TICKS !== 0) return;
+    if (this.roundCount % CONSUME_INTERVAL_ROUNDS !== 0) return;
     this.consumeNeed(villager, 'hunger');
     this.consumeNeed(villager, 'thirst');
     this.consumeNeed(villager, 'boredom');
@@ -893,6 +1014,59 @@ export class WorldEngine {
    * place-appropriate status line ("Looking over the fields", "Standing in the square").
    * The nearest match wins. Null when standing in the open.
    */
+  /**
+   * True when the point is within {@link SERVICE_REACH} of a technical depot — the
+   * cart-control station. From a depot a villager may set the order of ANY cart in
+   * the village, so this is the gate that lets {@link handleVillagerCommandCart} skip
+   * the "stand next to the cart" rule.
+   */
+  private atDepot(p: Vec2): boolean {
+    for (const b of this.buildings()) {
+      if (isDepot(b.kind) && this.rectDistance(p, b) <= SERVICE_REACH) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Ensure the world has a technical depot — the cart-control station. Worlds seeded
+   * after depots existed already carry one; this mints one on clear ground near the
+   * village centre for OLDER saves that predate it, so the cart fleet always has a
+   * place to be dispatched from. A no-op when a depot is already present.
+   */
+  private ensureDepot(): void {
+    if (this.buildings().some((b) => isDepot(b.kind))) return;
+    const bs = this.buildings();
+    const cx = bs.length
+      ? Math.round(bs.reduce((s, b) => s + b.position.x + b.width / 2, 0) / bs.length)
+      : Math.floor(this.width / 2);
+    const cy = bs.length
+      ? Math.round(bs.reduce((s, b) => s + b.position.y + b.height / 2, 0) / bs.length)
+      : Math.floor(this.height / 2);
+    const spec = buildableFor('depot');
+    const at = this.findFreeRect(cx, cy, spec.width, spec.height);
+    if (!at) {
+      console.warn('[engine] ensureDepot: no clear ground near the village centre — skipped');
+      return;
+    }
+    this.spawnSeq += 1;
+    const depot: Building = {
+      id: `building_depot_${this.spawnSeq}`,
+      type: 'building',
+      kind: 'depot',
+      name: "The Cartwright's Depot",
+      function: BUILDING_FUNCTIONS.depot,
+      position: { x: at.x, y: at.y },
+      width: spec.width,
+      height: spec.height,
+      color: BUILDING_COLORS.depot,
+      capacity: BUILDING_CAPACITY,
+      stock: {},
+    };
+    this.entities.set(depot.id, depot);
+    this.markStaticRect(at.x, at.y, spec.width, spec.height);
+    console.log(`[engine] ensureDepot: minted ${depot.name} (${depot.id}) at (${at.x}, ${at.y})`);
+  }
+
   private buildingWithinReach(p: Vec2): Building | null {
     let best: Building | null = null;
     let bestDist = Infinity;
@@ -970,6 +1144,7 @@ export class WorldEngine {
           command.name,
           command.x,
           command.y,
+          command.description,
         );
         return;
       case 'villager_command_cart':
@@ -1227,6 +1402,7 @@ export class WorldEngine {
     name: string,
     x: number,
     y: number,
+    description?: string,
   ): void {
     const villager = this.entities.get(villagerId);
     if (!villager || villager.type !== 'villager') {
@@ -1258,6 +1434,7 @@ export class WorldEngine {
     this.spawnSeq += 1;
     const trimmed = name.trim();
     const targetName = trimmed.length > 0 ? trimmed : spec.label.replace(/^a(n)? /, '');
+    const trimmedDesc = description?.trim();
     const construction: ConstructionState = {
       // A buildable raises EITHER a fixed building (`kind`) or a mobile cart
       // (`producesCart`) — carry whichever it declares through to completion.
@@ -1265,6 +1442,9 @@ export class WorldEngine {
       ...(spec.producesCart ? { targetCartTier: spec.producesCart } : {}),
       buildable: structure,
       targetName,
+      // An INVENTED structure carries its description through to completion, where it
+      // becomes the finished landmark's function (what villagers read about the place).
+      ...(trimmedDesc ? { description: trimmedDesc } : {}),
       required: { ...spec.cost },
     };
     const site: Building = {
@@ -1301,19 +1481,16 @@ export class WorldEngine {
    */
   private contributeToSite(villager: Villager, site: Building, resource: ResourceKind): void {
     const construction = site.construction!;
-    const required = construction.required[resource];
-    if (!required) {
+    if (construction.required[resource] === undefined) {
       const wanted = Object.keys(construction.required).join('/');
       this.setNotice(villager.id, `${site.name} needs ${wanted}, not ${resource}.`);
       console.warn(`[engine] contribute: ${site.name} does not need ${resource} — ignored`);
       return;
     }
-    const have = site.stock[resource] ?? 0;
-    const shortfall = required - have;
     const carried = villager.backpack.filter((r) => r === resource).length;
-    const amount = Math.min(carried, shortfall);
+    const amount = this.addMaterialToSite(site, resource, carried, villager);
     if (amount <= 0) {
-      console.warn(`[engine] contribute: nothing to add (${carried} carried, ${shortfall} short) — ignored`);
+      console.warn(`[engine] contribute: nothing to add (${carried} carried) — ignored`);
       return;
     }
     let removed = 0;
@@ -1324,14 +1501,39 @@ export class WorldEngine {
       }
       return true;
     });
+    console.log(`[engine] ${villager.id} added ${amount} ${resource} to ${site.name}`);
+  }
+
+  /**
+   * Add hauled MATERIAL to a construction site's gathered stock, capped at what the
+   * project still needs (never overfilled). When the last required unit lands the site
+   * finishes into its target structure (see {@link completeSite}). Shared by villagers
+   * handing materials over (`give_to`) and carts delivering to a site, so both raise a
+   * building identically. Returns how many units were actually accepted; the caller
+   * removes that many from its own store (backpack or cargo).
+   */
+  private addMaterialToSite(
+    site: Building,
+    resource: ResourceKind,
+    count: number,
+    actor?: Villager,
+  ): number {
+    const construction = site.construction;
+    if (!construction) return 0;
+    const required = construction.required[resource];
+    if (required === undefined) return 0;
+    const have = site.stock[resource] ?? 0;
+    const shortfall = required - have;
+    const amount = Math.min(Math.max(0, count), shortfall);
+    if (amount <= 0) return 0;
     site.stock[resource] = have + amount;
-    console.log(`[engine] ${villager.id} added ${amount} ${resource} to ${site.name} (${site.stock[resource]}/${required})`);
-    this.emitBuildingEvent(site, 'give', { actor: villager, resource, amount });
+    this.emitBuildingEvent(site, 'give', { actor, resource, amount });
     // Done when every required material has been fully gathered.
     const complete = Object.entries(construction.required).every(
       ([r, need]) => (site.stock[r as ResourceKind] ?? 0) >= (need ?? 0),
     );
-    if (complete) this.completeSite(site, villager);
+    if (complete) this.completeSite(site, actor);
+    return amount;
   }
 
   /**
@@ -1342,7 +1544,7 @@ export class WorldEngine {
    * chosen name is stamped on, the `construction` marker is cleared, and the static
    * world is re-announced so every observer re-renders the finished building.
    */
-  private completeSite(site: Building, finisher: Villager): void {
+  private completeSite(site: Building, finisher?: Villager): void {
     const construction = site.construction!;
     // A cart project leaves no building behind: it spawns a mobile cart and the site
     // is removed (its ground freed). Everything below is the building case.
@@ -1354,7 +1556,9 @@ export class WorldEngine {
     const targetName = construction.targetName;
     site.kind = targetKind;
     site.name = targetName;
-    site.function = BUILDING_FUNCTIONS[targetKind];
+    // An invented landmark wears the villagers' OWN description as its function; every
+    // other kind takes the standard per-kind line.
+    site.function = construction.description ?? BUILDING_FUNCTIONS[targetKind];
     site.color = BUILDING_COLORS[targetKind];
     site.capacity = BUILDING_CAPACITY;
     // A finished building starts with an EMPTY stock of whatever it now holds (a new
@@ -1378,7 +1582,7 @@ export class WorldEngine {
    * run with `command_cart`. The static world is re-announced to drop the shell; the
    * cart itself appears via the next per-tick state update (carts stream like villagers).
    */
-  private spawnCartFromSite(site: Building, tier: CartTier, finisher: Villager): void {
+  private spawnCartFromSite(site: Building, tier: CartTier, finisher?: Villager): void {
     const spec = cartSpecFor(tier);
     const centerX = site.position.x + site.width / 2;
     const centerY = site.position.y + site.height / 2;
@@ -1410,7 +1614,7 @@ export class WorldEngine {
       order: null,
       phase: 'idle',
       waitReason: null,
-      lastCommandedBy: finisher.id,
+      lastCommandedBy: finisher?.id ?? null,
     };
     this.entities.set(cart.id, cart);
     console.log(`[engine] "${site.construction?.targetName ?? cart.name}" finished — ${cart.name} (${cart.id}) rolls out`);
@@ -1440,9 +1644,15 @@ export class WorldEngine {
       console.warn(`[engine] command_cart: unknown cart "${cartId}" — ignored`);
       return;
     }
-    if (this.rectDistance(villager.position, cart) > SERVICE_REACH) {
-      this.setNotice(villager.id, `You must stand next to ${cart.name} to give it an order.`);
-      console.warn(`[engine] command_cart: ${villager.id} is not next to ${cart.name} — ignored`);
+    // A villager normally sets a cart's order standing beside it — but from the
+    // technical depot they may dispatch ANY cart in the village, wherever it is.
+    const beside = this.rectDistance(villager.position, cart) <= SERVICE_REACH;
+    if (!beside && !this.atDepot(villager.position)) {
+      this.setNotice(
+        villager.id,
+        `Stand next to ${cart.name} — or at the depot — to give it an order.`,
+      );
+      console.warn(`[engine] command_cart: ${villager.id} is neither next to ${cart.name} nor at a depot — ignored`);
       return;
     }
     if (fromBuildingId === toBuildingId) {
@@ -1460,7 +1670,12 @@ export class WorldEngine {
       this.setNotice(villager.id, `${from.name} has no ${resource} to load — pick a place that holds it.`);
       return;
     }
-    if (isConstructionSite(to.kind) || !buildingStockKinds(to.kind).includes(resource)) {
+    // A cart may deliver to a normal store that stocks the resource, OR to a
+    // construction site that still needs this material — so a single dispatch from
+    // the depot (e.g. quarry → building site) can feed a project to completion.
+    const siteNeeds =
+      isConstructionSite(to.kind) && to.construction !== undefined && to.construction.required[resource] !== undefined;
+    if (!siteNeeds && !buildingStockKinds(to.kind).includes(resource)) {
       this.setNotice(villager.id, `${to.name} cannot hold ${resource} — pick a place that stocks it.`);
       return;
     }
@@ -1557,13 +1772,16 @@ export class WorldEngine {
     }
 
     const color = SPAWN_VILLAGER_COLORS[this.spawnSeq % SPAWN_VILLAGER_COLORS.length]!;
+    const spawnId = `villager_spawn_${this.spawnSeq}`;
     const villager: Villager = {
-      id: `villager_spawn_${this.spawnSeq}`,
+      id: spawnId,
       name: 'Newcomer',
       type: 'villager',
       position: { x: ix, y: iy },
       target: null,
       color,
+      // A deterministic look so a God-spawned newcomer reads as a distinct figure.
+      appearance: deriveAppearance(spawnId, color),
       speed: 2,
       status: 'Idle',
       needs: defaultNeeds(),
@@ -1639,6 +1857,9 @@ export class WorldEngine {
       trees: this.trees().map((t) => this.cloneTree(t)),
       buildings: this.buildings().map((b) => this.cloneBuilding(b)),
       weather: this.weather,
+      ...(this.theme ? { theme: this.theme } : {}),
+      ...(this.setting ? { setting: this.setting } : {}),
+      ...(this.palette ? { palette: this.palette } : {}),
     };
   }
 
@@ -1755,6 +1976,31 @@ export class WorldEngine {
       carts: this.carts().map((c) => this.cloneCart(c)),
       // Persist the in-world clock so a restart resumes simulated time, not Day 1.
       clock: this.clockTick,
+      // Static FLAVOUR fields. The snapshot REPLACES the whole world document on
+      // every save, so these must be re-emitted here or they'd be wiped from the
+      // DB after the first snapshot — leaving a restart with the wrong ground
+      // colours (palette) and a missing theme/setting.
+      ...(this.theme ? { theme: this.theme } : {}),
+      ...(this.setting ? { setting: this.setting } : {}),
+      ...(this.palette ? { palette: this.palette } : {}),
+      // Transient state, so a restart resumes weather/sleep/work/notices in place.
+      weather: this.weather,
+      spawnSeq: this.spawnSeq,
+      sleepUntil: [...this.sleepUntil.entries()].map(([villagerId, s]) => ({
+        villagerId,
+        from: s.from,
+        until: s.until,
+        fatigue0: s.fatigue0,
+      })),
+      workSession: [...this.workSession.entries()].map(([villagerId, w]) => ({
+        villagerId,
+        inputUsed: w.inputUsed,
+      })),
+      notices: [...this.notices.entries()].map(([villagerId, n]) => ({
+        villagerId,
+        text: n.text,
+        untilTick: n.untilTick,
+      })),
     };
   }
 

@@ -31,6 +31,9 @@ const MAX_QUOTES = 5;
 /** How many of the day's prayers to carry into the summary for the god to weigh. */
 const MAX_PRAYERS = 5;
 
+/** How many of the day's finished structures to carry into the summary. */
+const MAX_BUILDS = 8;
+
 export class DailySummaryAggregator {
   /** The day currently being tallied; -1 until the first tick arrives. */
   private currentDay = -1;
@@ -43,6 +46,8 @@ export class DailySummaryAggregator {
   private readonly activeVillagers = new Set<string>();
   private quotes: string[] = [];
   private prayers: string[] = [];
+  /** Structures finished this day (one human line each) — the objective growth signal. */
+  private completedBuilds: string[] = [];
 
   constructor(private readonly bus: EventBus) {}
 
@@ -91,6 +96,16 @@ export class DailySummaryAggregator {
       case 'world.weather_changed':
         this.weather = event.payload.weather;
         return;
+      case 'world.building_event': {
+        // A finished construction is the day's clearest sign of growth — record it so
+        // the god can weigh how city-like the village is becoming and name a milestone.
+        const e = event.payload;
+        if (e.kind === 'completed' && this.completedBuilds.length < MAX_BUILDS) {
+          const what = e.note ? `${e.buildingName} — ${e.note}` : e.buildingName;
+          this.completedBuilds.push(what);
+        }
+        return;
+      }
       case 'world.init':
         this.weather = event.payload.weather;
         return;
@@ -125,6 +140,7 @@ export class DailySummaryAggregator {
         weather: this.weather,
         ...(this.quotes.length > 0 ? { notableQuotes: this.quotes.slice() } : {}),
         ...(this.prayers.length > 0 ? { notablePrayers: this.prayers.slice() } : {}),
+        ...(this.completedBuilds.length > 0 ? { completedBuilds: this.completedBuilds.slice() } : {}),
       }),
     );
     console.log(
@@ -140,5 +156,6 @@ export class DailySummaryAggregator {
     this.activeVillagers.clear();
     this.quotes = [];
     this.prayers = [];
+    this.completedBuilds = [];
   }
 }

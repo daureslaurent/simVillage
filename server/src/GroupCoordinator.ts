@@ -30,11 +30,14 @@ import {
 } from '../../shared/events';
 import type { GroupPlan, GroupPlanMember } from '../../shared/types';
 import { buildableFor } from '../../shared/buildings';
+import type { RuntimeStateStore } from './persistence/RuntimeStateStore';
 
 /** Plans with no activity for this many ticks are dropped (about a working session). */
 const PLAN_TTL_TICKS = 60;
 /** Most plans to keep live at once, so a chatty village can't grow the list unbounded. */
 const MAX_ACTIVE_PLANS = 12;
+/** The runtime-state key the village's shared plans are persisted under. */
+const GROUP_PLANS_KEY = 'group-plans';
 
 export class GroupCoordinator {
   /** Active plans, newest interaction first when listed. */
@@ -46,9 +49,17 @@ export class GroupCoordinator {
   /** id -> display name, kept current from the world stream. */
   private readonly names = new Map<string, string>();
 
-  constructor(private readonly bus: EventBus) {}
+  constructor(
+    private readonly bus: EventBus,
+    /** Optional durable store so the village's shared plans survive a reboot. */
+    private readonly state?: RuntimeStateStore,
+  ) {}
 
   async start(): Promise<void> {
+    // Restore the village's shared plans first, so a reboot keeps work crews and
+    // prayer rituals alive instead of erasing the agenda. Best-effort.
+    await this.restorePlans();
+
     // Track gatherings + tick + names off the world stream.
     await this.bus.subscribe<WorldEvent>(EXCHANGES.worldEvents, 'world.map_updated', (event) => {
       if (event.type !== 'world.map_updated') return;
@@ -131,7 +142,7 @@ export class GroupCoordinator {
    * build crew. The proposer's role is to lead the raising; the goal names the
    * structure and what it needs, so joiners know what to haul.
    */
-  private onProposeBuild(p: { villagerId: string; structure: string; name: string }): void {
+  private onProposeBuild(p: { villagerId: string; structure: string; name: string; description?: string }): void {
     // One open plan per proposer: a fresh proposal supersedes the proposer's last.
     for (const [id, plan] of this.plans) {
       if (plan.proposerId === p.villagerId) this.plans.delete(id);
@@ -141,11 +152,17 @@ export class GroupCoordinator {
     const needs = spec
       ? Object.entries(spec.cost).map(([r, n]) => `${n} ${r}`).join(', ')
       : 'materials';
+    // For an invented structure, name what it IS (its description) rather than the
+    // generic "a new structure", so the crew knows the thing they are raising.
+    const what =
+      p.structure === 'custom' && p.description
+        ? `${p.description}, "${p.name}"`
+        : `${spec?.label ?? 'a structure'}, "${p.name}"`;
     const plan: GroupPlan = {
       id: `plan_${p.villagerId}_${this.tick}`,
       proposerId: p.villagerId,
       proposerName: name,
-      goal: `Raise ${spec?.label ?? 'a structure'}, "${p.name}" — haul ${needs} to the site`,
+      goal: `Raise ${what} — haul ${needs} to the site`,
       kind: 'build',
       members: [{ villagerId: p.villagerId, villagerName: name, role: 'leading the build' }],
       startTick: this.tick,
@@ -189,9 +206,14 @@ export class GroupCoordinator {
   }
 
   private expireStale(): void {
+    let dropped = false;
     for (const [id, plan] of this.plans) {
-      if (this.tick - plan.lastTick > PLAN_TTL_TICKS) this.plans.delete(id);
+      if (this.tick - plan.lastTick > PLAN_TTL_TICKS) {
+        this.plans.delete(id);
+        dropped = true;
+      }
     }
+    if (dropped) void this.persistPlans();
   }
 
   /** Keep only the most recent {@link MAX_ACTIVE_PLANS} plans. */
@@ -203,11 +225,43 @@ export class GroupCoordinator {
 
   private broadcast(plan: GroupPlan): void {
     this.bus.publish(EXCHANGES.villagerTelemetry, makeEvent('villager.group_plan.updated', plan));
+    void this.persistPlans();
   }
 
   private nameOf(id: string): string {
     return this.names.get(id) ?? id;
   }
+
+  // -------------------------------------------------------------------------
+  // Durable state: the village's shared agenda survives a reboot
+  // -------------------------------------------------------------------------
+
+  /** Reload persisted plans on boot (best-effort; a fresh store yields nothing). */
+  private async restorePlans(): Promise<void> {
+    if (!this.state) return;
+    try {
+      const saved = await this.state.get<GroupPlan[]>(GROUP_PLANS_KEY);
+      if (!saved || saved.length === 0) return;
+      for (const plan of saved) this.plans.set(plan.id, plan);
+      console.log(`[group] restored ${this.plans.size} shared plan(s)`);
+    } catch (err) {
+      console.warn('[group] failed to restore plans:', errMsg(err));
+    }
+  }
+
+  /** Persist the live plans after a change (fire-and-forget; never blocks). */
+  private async persistPlans(): Promise<void> {
+    if (!this.state) return;
+    try {
+      await this.state.set<GroupPlan[]>(GROUP_PLANS_KEY, this.all());
+    } catch (err) {
+      console.warn('[group] failed to persist plans:', errMsg(err));
+    }
+  }
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** Convenience for prompt/UI: a one-line summary of a plan's roster. */

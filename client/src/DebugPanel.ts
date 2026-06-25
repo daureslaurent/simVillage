@@ -56,11 +56,10 @@ export class DebugPanel {
   }
 
   /**
-   * The current logical tick (turn-coordinator round): who is acting this round
-   * and who is resting on cooldown (and for how many more ticks). Also clocks
-   * the wall-clock gap since the previous round, for the rolling avg-sec/tick
-   * readout — the thing that actually tells you how fast the village is living,
-   * since LLM latency (not `MIN_ROUND_MS`) is usually what paces a round.
+   * The current in-world tick from the scheduler: who is thinking right now (up to
+   * the pool's parallel capacity) and who is resting on cooldown (seconds left).
+   * Also clocks the wall-clock gap since the previous tick, for the rolling
+   * avg-sec/tick readout — how fast the village is living.
    */
   setTick(tick: number, acting: string[], cooldown: Record<string, number>): void {
     this.tickEl.textContent = String(tick);
@@ -152,6 +151,12 @@ function summarize(d: AgentDecision | null): string {
       return `build ${d.structure}: "${truncate(d.name, 40)}" @(${d.x}, ${d.y})`;
     case 'command_cart':
       return `cart ${d.cartId}: ${d.resource} ${d.fromBuildingId}→${d.toBuildingId}`;
+    case 'add_to_agenda':
+      return `agenda +${d.itemKind}: "${truncate(d.title, 50)}"`;
+    case 'propose_event':
+      return `propose event: "${truncate(d.title, 45)}" (+${d.dayOffset}d ${d.partOfDay})`;
+    case 'accept_event':
+      return `accept event ${d.eventId}`;
   }
 }
 

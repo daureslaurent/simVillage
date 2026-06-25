@@ -3,48 +3,74 @@
  * ---------------------------------------------------------------------------
  * The left-docked VILLAGER ROSTER.
  *
- *   ROSTER VIEW   — one card per villager currently in the world. Click a card…
- *   HISTORY VIEW  — …to see every action/interaction that villager has taken,
- *                   newest first. The list is seeded from the durable action log
- *                   (fetched over HTTP) and then kept live as new thoughts stream
- *                   in. Each row carries a "LLM" button that pops a MODAL with the
- *                   technical context behind that action: the prompt sent to the
- *                   model, the memories RAG recalled, and the raw model output.
+ * One CARD per villager in the world. A card's always-visible face carries the
+ * villager's name, live status and need bars. Click it and the card EXPANDS in
+ * place (accordion — opening one collapses any other) into three tabs:
+ *
+ *   LOG        — every action/interaction the villager has taken, newest first.
+ *                Seeded from the durable action log (fetched over HTTP) and kept
+ *                live as new thoughts stream in. Each row carries an "LLM" button
+ *                that pops a modal with the technical context behind that action.
+ *   MEMORIES   — the villager's stored long-term memories (RAG), newest first.
+ *   CHARACTER  — the static persona: traits, goal and backstory.
  *
  * The panel owns its DOM and stays transport-agnostic: `main.ts` injects the
- * history fetcher and feeds it the world's villager list + the thought stream.
+ * data fetchers and feeds it the world's villager list + the thought stream.
  * ---------------------------------------------------------------------------
  */
 
-import type { AgentDecision, Gathering, Villager, VillagerNeeds, VillagerActionRecord, VillagerThoughtMessage } from '../../shared/types';
+import type {
+  AgentDecision,
+  Gathering,
+  Villager,
+  VillagerNeeds,
+  VillagerActionRecord,
+  VillagerMemory,
+  VillagerPersona,
+  VillagerThoughtMessage,
+} from '../../shared/types';
 import { BACKPACK_CAPACITY } from '../../shared/types';
 import { escapeHtml, showModal } from './modal';
 
 export interface RosterOptions {
   /** Load a villager's persisted action history (newest first). */
   onFetchActions: (villagerId: string) => Promise<VillagerActionRecord[]>;
+  /** Load a villager's stored long-term memories (newest first). */
+  onFetchMemories: (villagerId: string) => Promise<VillagerMemory[]>;
+  /** Load a villager's static persona (identity / character), or null if unknown. */
+  onFetchPersona: (villagerId: string) => Promise<VillagerPersona | null>;
 }
 
-/** How many live-appended actions to keep before trimming the history view. */
+/** How many live-appended actions to keep before trimming the log. */
 const MAX_ROWS = 300;
+
+/** The three drawers inside an expanded card. */
+type TabKey = 'log' | 'memories' | 'character';
+
+/** Per-card UI state: which tab is showing and which tabs have loaded once. */
+interface CardState {
+  tab: TabKey;
+  loaded: Set<TabKey>;
+}
 
 export class RosterPanel {
   private readonly listEl: HTMLElement;
-  private readonly titleEl: HTMLElement;
-  private readonly backBtn: HTMLButtonElement;
 
-  /** Villager currently expanded into history view, or null in roster view. */
-  private selectedId: string | null = null;
+  /** id -> the card element currently shown, so live stats update in place. */
+  private readonly cardById = new Map<string, HTMLElement>();
+  /** id -> its expansion/tab state. */
+  private readonly stateById = new Map<string, CardState>();
+  /** The one expanded card's id, or null when all are collapsed (accordion). */
+  private expandedId: string | null = null;
+
   /** Last rendered roster signature, to avoid rebuilding cards every tick. */
   private rosterSig = '';
   /** id -> display name, learned from the thought/action streams. */
   private readonly names = new Map<string, string>();
-  /** Latest villager list, so we can re-render the roster after going "back". */
+  /** Latest villager list, so we can re-render the roster after a membership change. */
   private villagers: Villager[] = [];
   /** Latest gatherings, so each card can show who its villager is grouped with. */
   private gatherings: Gathering[] = [];
-  /** id -> the card element currently shown, so live stats update in place. */
-  private readonly cardById = new Map<string, HTMLElement>();
 
   constructor(
     root: HTMLElement,
@@ -53,15 +79,12 @@ export class RosterPanel {
     root.classList.add('roster');
     root.innerHTML = `
       <header class="roster__head">
-        <button class="roster__back" title="Back to villagers" hidden>←</button>
         <span class="roster__title">Villagers</span>
+        <span class="roster__count"></span>
       </header>
       <div class="roster__list"></div>`;
 
-    this.titleEl = root.querySelector('.roster__title')!;
     this.listEl = root.querySelector('.roster__list')!;
-    this.backBtn = root.querySelector('.roster__back')!;
-    this.backBtn.addEventListener('click', () => this.showRoster());
   }
 
   // -------------------------------------------------------------------------
@@ -76,7 +99,6 @@ export class RosterPanel {
   syncVillagers(villagers: Villager[], gatherings: Gathering[] = []): void {
     this.villagers = villagers;
     this.gatherings = gatherings;
-    if (this.selectedId) return; // history view is open; don't disturb it
     const sig = villagers.map((v) => v.id).sort().join(',');
     if (sig !== this.rosterSig) {
       this.rosterSig = sig;
@@ -88,13 +110,20 @@ export class RosterPanel {
   /** Feed one thought: learn the villager's name, and live-append if it acted. */
   ingest(thought: VillagerThoughtMessage): void {
     this.names.set(thought.villagerId, thought.villagerName);
-    if (thought.villagerId !== this.selectedId || !thought.decision) return;
+    if (!thought.decision) return;
+    const state = this.stateById.get(thought.villagerId);
+    // Only the open card's loaded LOG tab keeps a live tail.
+    if (this.expandedId !== thought.villagerId || !state || state.tab !== 'log' || !state.loaded.has('log')) return;
+    const panel = this.panelEl(thought.villagerId, 'log');
+    if (!panel) return;
     this.prependRow(
+      panel,
       this.actionRow({
         villagerId: thought.villagerId,
         villagerName: thought.villagerName,
         tick: thought.tick,
         decision: thought.decision,
+        decisionSource: thought.decisionSource,
         recalledMemories: thought.recalledMemories,
         prompt: thought.prompt,
         rawOutput: thought.rawOutput,
@@ -104,96 +133,103 @@ export class RosterPanel {
   }
 
   // -------------------------------------------------------------------------
-  // Roster view
+  // Roster rendering
   // -------------------------------------------------------------------------
-
-  private showRoster(): void {
-    this.selectedId = null;
-    this.rosterSig = ''; // force a rebuild
-    this.backBtn.hidden = true;
-    this.titleEl.textContent = 'Villagers';
-    this.renderRoster();
-  }
 
   /** Build the (static) card skeletons; live values are filled by {@link updateStats}. */
   private renderRoster(): void {
     this.cardById.clear();
-    const cards = this.villagers.map((v) => {
-      const card = document.createElement('button');
-      card.className = 'roster__card';
-      card.innerHTML = `
-        <div class="roster__top">
-          <span class="roster__swatch" style="background:${escapeAttr(v.color)}"></span>
-          <span class="roster__name"></span>
-        </div>
-        <div class="roster__status"></div>
-        <div class="roster__task" hidden></div>
-        <div class="roster__needs">
-          ${needRow('Hunger')}
-          ${needRow('Thirst')}
-          ${needRow('Fatigue')}
-          ${needRow('Boredom')}
-        </div>
-        <div class="roster__pack" title="backpack"></div>
-        <div class="roster__group" hidden></div>`;
-      card.addEventListener('click', () => void this.openHistory(v.id));
-      this.cardById.set(v.id, card);
-      return card;
-    });
+    const cards = this.villagers.map((v) => this.buildCard(v));
     this.listEl.replaceChildren(...cards);
     if (cards.length === 0) {
       this.listEl.innerHTML = `<div class="roster__empty">no villagers yet…</div>`;
     }
+    this.updateCount();
+    // A rebuild replaces every card's DOM, so the old panels are detached: drop
+    // the expansion and the per-tab load caches rather than point at stale nodes.
+    this.expandedId = null;
+    for (const st of this.stateById.values()) st.loaded.clear();
   }
 
-  /** Refresh the live values (name, status, need bars, backpack) on every card. */
+  private buildCard(v: Villager): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'vcard';
+    card.dataset.id = v.id;
+    card.innerHTML = `
+      <button class="vcard__face" aria-expanded="false">
+        <span class="vcard__swatch" style="background:${escapeAttr(v.color)}"></span>
+        <span class="vcard__id">
+          <span class="vcard__name"></span>
+          <span class="vcard__status"></span>
+        </span>
+        <span class="vcard__chev" aria-hidden="true">›</span>
+      </button>
+      <div class="vcard__needs">
+        ${needRow('Hunger')}
+        ${needRow('Thirst')}
+        ${needRow('Fatigue')}
+        ${needRow('Boredom')}
+      </div>
+      <div class="vcard__body" hidden>
+        <div class="vcard__now"></div>
+        <div class="vtabs" role="tablist">
+          <button class="vtab is-active" data-tab="log">Log</button>
+          <button class="vtab" data-tab="memories">Memories</button>
+          <button class="vtab" data-tab="character">Character</button>
+        </div>
+        <div class="vpanel" data-panel="log"></div>
+        <div class="vpanel" data-panel="memories" hidden></div>
+        <div class="vpanel" data-panel="character" hidden></div>
+      </div>`;
+
+    card.querySelector('.vcard__face')!.addEventListener('click', () => this.toggle(v.id));
+    for (const tab of card.querySelectorAll<HTMLElement>('.vtab')) {
+      tab.addEventListener('click', () => this.selectTab(v.id, tab.dataset.tab as TabKey));
+    }
+    this.cardById.set(v.id, card);
+    if (!this.stateById.has(v.id)) this.stateById.set(v.id, { tab: 'log', loaded: new Set() });
+    return card;
+  }
+
+  /** Refresh the live values (name, status, need bars, backpack, group) on every card. */
   private updateStats(): void {
     for (const v of this.villagers) {
       const card = this.cardById.get(v.id);
       if (!card) continue;
 
       const name = v.name || this.names.get(v.id) || v.id;
-      setText(card, '.roster__name', name);
-      setText(card, '.roster__status', v.status ?? (v.target ? 'walking' : 'idle'));
-
-      // The villager's standing job (a refill chore), if any — shown as a small
-      // task line so it's clear who is busy keeping the village's buildings stocked.
-      const task = card.querySelector('.roster__task') as HTMLElement | null;
-      if (task) {
-        if (v.task) {
-          task.textContent = `🛠️ ${v.task.label}`;
-          task.hidden = false;
-        } else {
-          task.hidden = true;
-        }
-      }
+      setText(card, '.vcard__name', name);
+      const status = v.status ?? (v.target ? 'walking' : 'idle');
+      setText(card, '.vcard__status', v.asleep ? `💤 ${status}` : status);
+      card.classList.toggle('vcard--asleep', !!v.asleep);
 
       if (v.needs) this.fillNeeds(card, v.needs);
-
-      const pack = card.querySelector('.roster__pack');
-      if (pack) {
-        const items = v.backpack ?? [];
-        const filled = Math.min(items.length, BACKPACK_CAPACITY);
-        const pips = '●'.repeat(filled) + '○'.repeat(Math.max(0, BACKPACK_CAPACITY - filled));
-        pack.textContent = `🎒 ${pips}`;
-        pack.setAttribute('title', items.length ? items.join(', ') : 'empty');
-      }
-
-      const group = card.querySelector('.roster__group') as HTMLElement | null;
-      if (group) {
-        const gathering = this.gatherings.find((g) => g.memberIds.includes(v.id));
-        if (gathering) {
-          const others = gathering.memberIds
-            .filter((id) => id !== v.id)
-            .map((id) => this.displayName(id));
-          const where = gathering.place ? ` at ${gathering.place}` : '';
-          group.textContent = `👥 with ${others.join(', ')}${where}`;
-          group.hidden = false;
-        } else {
-          group.hidden = true;
-        }
-      }
+      this.fillNow(card, v);
     }
+  }
+
+  /** The expanded "right now" summary line: current job, backpack, and group. */
+  private fillNow(card: HTMLElement, v: Villager): void {
+    const now = card.querySelector('.vcard__now');
+    if (!now) return;
+    const bits: string[] = [];
+
+    if (v.task) bits.push(`<span class="now__chip">🛠️ ${escapeHtml(v.task.label)}</span>`);
+
+    const items = v.backpack ?? [];
+    const filled = Math.min(items.length, BACKPACK_CAPACITY);
+    const pips = '●'.repeat(filled) + '○'.repeat(Math.max(0, BACKPACK_CAPACITY - filled));
+    const packTitle = items.length ? escapeAttr(items.join(', ')) : 'empty';
+    bits.push(`<span class="now__chip" title="${packTitle}">🎒 ${pips}</span>`);
+
+    const gathering = this.gatherings.find((g) => g.memberIds.includes(v.id));
+    if (gathering) {
+      const others = gathering.memberIds.filter((id) => id !== v.id).map((id) => this.displayName(id));
+      const where = gathering.place ? ` at ${escapeHtml(gathering.place)}` : '';
+      bits.push(`<span class="now__chip">👥 ${escapeHtml(others.join(', '))}${where}</span>`);
+    }
+
+    now.innerHTML = bits.join('');
   }
 
   /** Best-known display name for an id: the entity name, then a learned name, then the id. */
@@ -219,55 +255,166 @@ export class RosterPanel {
     }
   }
 
+  private updateCount(): void {
+    const el = this.listEl.parentElement?.querySelector('.roster__count');
+    if (el) el.textContent = this.villagers.length ? String(this.villagers.length) : '';
+  }
+
   // -------------------------------------------------------------------------
-  // History view
+  // Expansion + tabs
   // -------------------------------------------------------------------------
 
-  private async openHistory(villagerId: string): Promise<void> {
-    this.selectedId = villagerId;
-    this.backBtn.hidden = false;
-    const villager = this.villagers.find((v) => v.id === villagerId);
-    this.titleEl.textContent = villager?.name || this.names.get(villagerId) || villagerId;
-    this.listEl.replaceChildren();
-    this.listEl.innerHTML = `<div class="roster__empty">loading actions…</div>`;
+  /** Toggle a card open/closed; opening it collapses any other open card. */
+  private toggle(villagerId: string): void {
+    if (this.expandedId === villagerId) {
+      this.collapse(villagerId);
+      this.expandedId = null;
+      return;
+    }
+    if (this.expandedId) this.collapse(this.expandedId);
+    this.expandedId = villagerId;
+    this.expand(villagerId);
+  }
 
-    let records: VillagerActionRecord[] = [];
+  private collapse(villagerId: string): void {
+    const card = this.cardById.get(villagerId);
+    if (!card) return;
+    card.classList.remove('vcard--open');
+    card.querySelector('.vcard__face')!.setAttribute('aria-expanded', 'false');
+    (card.querySelector('.vcard__body') as HTMLElement).hidden = true;
+  }
+
+  private expand(villagerId: string): void {
+    const card = this.cardById.get(villagerId);
+    if (!card) return;
+    card.classList.add('vcard--open');
+    card.querySelector('.vcard__face')!.setAttribute('aria-expanded', 'true');
+    (card.querySelector('.vcard__body') as HTMLElement).hidden = false;
+    const state = this.stateById.get(villagerId)!;
+    this.showTab(villagerId, state.tab);
+    void this.loadTab(villagerId, state.tab);
+    card.scrollIntoView({ block: 'nearest' });
+  }
+
+  private selectTab(villagerId: string, tab: TabKey): void {
+    const state = this.stateById.get(villagerId);
+    if (!state) return;
+    state.tab = tab;
+    this.showTab(villagerId, tab);
+    void this.loadTab(villagerId, tab);
+  }
+
+  /** Flip the active tab button + panel visibility. */
+  private showTab(villagerId: string, tab: TabKey): void {
+    const card = this.cardById.get(villagerId);
+    if (!card) return;
+    for (const btn of card.querySelectorAll<HTMLElement>('.vtab')) {
+      btn.classList.toggle('is-active', btn.dataset.tab === tab);
+    }
+    for (const panel of card.querySelectorAll<HTMLElement>('.vpanel')) {
+      panel.hidden = panel.dataset.panel !== tab;
+    }
+  }
+
+  private panelEl(villagerId: string, tab: TabKey): HTMLElement | null {
+    return this.cardById.get(villagerId)?.querySelector(`.vpanel[data-panel="${tab}"]`) ?? null;
+  }
+
+  /** Fetch a tab's data on first view; cached thereafter (LOG keeps a live tail). */
+  private async loadTab(villagerId: string, tab: TabKey): Promise<void> {
+    const state = this.stateById.get(villagerId);
+    const panel = this.panelEl(villagerId, tab);
+    if (!state || !panel || state.loaded.has(tab)) return;
+    state.loaded.add(tab);
+    panel.innerHTML = `<div class="vpanel__loading">loading…</div>`;
     try {
-      records = await this.options.onFetchActions(villagerId);
+      if (tab === 'log') await this.renderLog(villagerId, panel);
+      else if (tab === 'memories') await this.renderMemories(villagerId, panel);
+      else await this.renderCharacter(villagerId, panel);
     } catch {
-      this.listEl.innerHTML = `<div class="roster__empty">failed to load history</div>`;
-      return;
+      state.loaded.delete(tab); // let a re-open retry
+      panel.innerHTML = `<div class="vpanel__empty">failed to load</div>`;
     }
-    if (this.selectedId !== villagerId) return; // user navigated away while loading
+  }
 
+  // -------------------------------------------------------------------------
+  // LOG tab
+  // -------------------------------------------------------------------------
+
+  private async renderLog(villagerId: string, panel: HTMLElement): Promise<void> {
+    const records = await this.options.onFetchActions(villagerId);
+    if (this.stateById.get(villagerId)?.loaded.has('log') !== true) return; // collapsed mid-load
     if (records.length === 0) {
-      this.listEl.innerHTML = `<div class="roster__empty">no actions recorded yet</div>`;
+      panel.innerHTML = `<div class="vpanel__empty">no actions recorded yet</div>`;
       return;
     }
-    this.listEl.replaceChildren(...records.map((r) => this.actionRow(r)));
+    panel.replaceChildren(...records.map((r) => this.actionRow(r)));
   }
 
   /** Build one action row: a summary line + a button into the LLM-data modal. */
   private actionRow(r: VillagerActionRecord): HTMLElement {
     const row = document.createElement('div');
     row.className = 'action';
+    // A fallback turn wasn't chosen by the model (engine error / unusable output) —
+    // flag it so the log doesn't read as if the mind decided it.
+    const fallback =
+      r.decisionSource === 'fallback'
+        ? ' <span class="action__fallback" title="Scripted fallback — the model produced no usable decision this turn">fallback</span>'
+        : '';
     row.innerHTML = `
       <div class="action__main">
         <span class="action__tick">t${r.tick}</span>
-        <span class="action__desc">${escapeHtml(describe(r.decision))}</span>
+        <span class="action__desc">${escapeHtml(describe(r.decision))}${fallback}</span>
       </div>
       <button class="action__llm" title="Technical LLM data">LLM</button>`;
     row.querySelector('.action__llm')!.addEventListener('click', () => this.openModal(r));
     return row;
   }
 
-  private prependRow(row: HTMLElement): void {
-    const empty = this.listEl.querySelector('.roster__empty');
+  private prependRow(panel: HTMLElement, row: HTMLElement): void {
+    const empty = panel.querySelector('.vpanel__empty');
     if (empty) empty.remove();
-    this.listEl.prepend(row);
-    while (this.listEl.childElementCount > MAX_ROWS) {
-      this.listEl.lastElementChild?.remove();
+    panel.prepend(row);
+    while (panel.childElementCount > MAX_ROWS) {
+      panel.lastElementChild?.remove();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // MEMORIES tab
+  // -------------------------------------------------------------------------
+
+  private async renderMemories(villagerId: string, panel: HTMLElement): Promise<void> {
+    const memories = await this.options.onFetchMemories(villagerId);
+    if (this.stateById.get(villagerId)?.loaded.has('memories') !== true) return;
+    if (memories.length === 0) {
+      panel.innerHTML = `<div class="vpanel__empty">no memories formed yet</div>`;
+      return;
+    }
+    panel.replaceChildren(...memories.map((m) => memoryRow(m)));
+  }
+
+  // -------------------------------------------------------------------------
+  // CHARACTER tab
+  // -------------------------------------------------------------------------
+
+  private async renderCharacter(villagerId: string, panel: HTMLElement): Promise<void> {
+    const persona = await this.options.onFetchPersona(villagerId);
+    if (this.stateById.get(villagerId)?.loaded.has('character') !== true) return;
+    if (!persona) {
+      panel.innerHTML = `<div class="vpanel__empty">no character on file</div>`;
+      return;
+    }
+    const traits = persona.traits.length
+      ? `<div class="char__traits">${persona.traits.map((t) => `<span class="char__trait">${escapeHtml(t)}</span>`).join('')}</div>`
+      : '';
+    const goal = persona.goal
+      ? `<div class="char__field"><i>Goal</i><p>${escapeHtml(persona.goal)}</p></div>`
+      : '';
+    const backstory = persona.backstory
+      ? `<div class="char__field"><i>Backstory</i><p>${escapeHtml(persona.backstory)}</p></div>`
+      : '';
+    panel.innerHTML = `${traits}${goal}${backstory}` || `<div class="vpanel__empty">no character details</div>`;
   }
 
   // -------------------------------------------------------------------------
@@ -281,7 +428,17 @@ export class RosterPanel {
           .join('\n')
       : '  (none recalled)';
 
-    const header = `${escapeHtml(r.villagerName)} · tick ${r.tick} · <b>${escapeHtml(describe(r.decision))}</b>`;
+    const fallbackTag =
+      r.decisionSource === 'fallback'
+        ? ' · <span class="action__fallback">fallback</span>'
+        : '';
+    const header = `${escapeHtml(r.villagerName)} · tick ${r.tick} · <b>${escapeHtml(describe(r.decision))}</b>${fallbackTag}`;
+    // For a fallback turn there is no authored output to show; say so rather than
+    // leaving a bare "(empty)" that reads like a bug.
+    const rawLabel =
+      r.decisionSource === 'fallback'
+        ? '(no model output — scripted fallback substituted after the model produced nothing usable)'
+        : '(empty)';
     const body = `
       <details open>
         <summary>recalled memories (${r.recalledMemories.length})</summary>
@@ -297,7 +454,7 @@ export class RosterPanel {
       </details>
       <details open>
         <summary>raw model output</summary>
-        <pre>${escapeHtml(r.rawOutput || '(empty)')}</pre>
+        <pre>${escapeHtml(r.rawOutput || rawLabel)}</pre>
       </details>`;
     showModal(header, body);
   }
@@ -330,7 +487,45 @@ function describe(d: AgentDecision): string {
       return `propose building ${d.structure} "${d.name}" at (${d.x}, ${d.y})`;
     case 'command_cart':
       return `set cart ${d.cartId}: haul ${d.resource} from ${d.fromBuildingId} to ${d.toBuildingId}`;
+    case 'add_to_agenda':
+      return d.itemKind === 'event'
+        ? `add event to agenda: "${d.title}"${d.partOfDay ? ` (+${d.dayOffset ?? 0}d ${d.partOfDay})` : ''}`
+        : `note on agenda: "${d.title}"`;
+    case 'propose_event':
+      return `propose event: "${d.title}" (+${d.dayOffset}d ${d.partOfDay})`;
+    case 'accept_event':
+      return `accept event ${d.eventId}`;
   }
+}
+
+/** One stored memory rendered as a row: a kind badge, relative age, and the text. */
+function memoryRow(m: VillagerMemory): HTMLElement {
+  const row = document.createElement('div');
+  row.className = `memory memory--${escapeAttr(m.kind)}`;
+  row.innerHTML = `
+    <div class="memory__meta">
+      <span class="memory__kind">${escapeHtml(m.kind)}</span>
+      <span class="memory__age">${escapeHtml(relativeTime(m.timestamp))}</span>
+    </div>
+    <div class="memory__text">${escapeHtml(m.text)}</div>`;
+  // A salience dot whose opacity tracks importance, so reflections read as weightier.
+  const dot = document.createElement('span');
+  dot.className = 'memory__dot';
+  dot.style.opacity = String(Math.max(0.2, Math.min(1, m.importance)));
+  dot.title = `importance ${m.importance.toFixed(2)}`;
+  row.querySelector('.memory__meta')!.prepend(dot);
+  return row;
+}
+
+/** A compact "3h ago" style age from a wall-clock ms timestamp. */
+function relativeTime(ms: number): string {
+  const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (secs < 60) return 'just now';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
 }
 
 /** Escape a value destined for an HTML attribute (e.g. a CSS color). */

@@ -22,7 +22,9 @@
  */
 
 import type { AgentDecision, Building, LlmCallStartedMessage, LlmCallFinishedMessage, ResourceKind, Villager, VillagerNeeds, VillagerThoughtMessage, Tree, WeatherKind } from '../../shared/types';
-import { BACKPACK_CAPACITY } from '../../shared/types';
+import { BACKPACK_CAPACITY, DEFAULT_TERRAIN_PALETTE } from '../../shared/types';
+import { deriveAppearance } from '../../shared/appearance';
+import { drawVillagerSprite } from './villagerSprite';
 import { buildingStockKinds, isDepleted, SERVICE_REACH } from '../../shared/buildings';
 import { daylightFromTick } from '../../shared/simClock';
 import { sightRadius, hearingRadius } from '../../shared/perception';
@@ -36,6 +38,17 @@ const RESOURCE_ICON: Record<ResourceKind, string> = {
   goods: '📦',
   stone: '🪨',
 };
+
+/**
+ * A small deterministic 32-bit hash of two integers — used to lay out the ground's
+ * accent blotches the same way every frame (no per-frame shimmer) without storing
+ * anything. Cheap integer mixing; quality is irrelevant, only stability is.
+ */
+function hash2(x: number, y: number): number {
+  let h = (x * 374761393 + y * 668265263) | 0;
+  h = (h ^ (h >>> 13)) * 1274126177;
+  return (h ^ (h >>> 16)) >>> 0;
+}
 
 /** The villager the God Hand commands by default (per the Phase 1 spec). */
 const GOD_HAND_TARGET = 'villager_1';
@@ -140,6 +153,16 @@ export class Renderer {
   /** Until when (epoch ms) a storm lightning flash is still fading. */
   private stormFlashUntil = 0;
 
+  /**
+   * Per-frame VISUAL de-overlap offsets (in world cells), keyed by villager id.
+   * When villagers pile onto the same spot the backend leaves them there; this
+   * fans them out a little on screen so each stays individually visible, with a
+   * faint tether back to their true position. Recomputed every frame, used by the
+   * body, stat-card and bubble draws so they all move together. Empty = no
+   * overlap. See {@link computeFanOffsets} / {@link fanScreen}.
+   */
+  private fanOffsets = new Map<string, { dx: number; dy: number }>();
+
   /** The currently-selected villager (highlighted + inspected), or null. */
   private selectedId: string | null = null;
   /** Hook fired when a click selects a villager — the UI opens its inspector. */
@@ -148,6 +171,10 @@ export class Renderer {
   private selectedBuildingId: string | null = null;
   /** Hook fired when a click selects a building — the UI opens its inspector. */
   onSelectBuilding: ((buildingId: string) => void) | null = null;
+  /** A cart momentarily highlighted (e.g. located from the depot fleet list), or null. */
+  private focusCartId: string | null = null;
+  /** Clears the cart highlight after a short while. */
+  private focusCartTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -232,13 +259,17 @@ export class Renderer {
 
     const scale = this.scale;
 
+    // The themed ground (grass / sand / ash …), filled within the world bounds and
+    // blotched for texture, before anything else is laid on top of it.
+    this.drawGround(view, scale);
+
     this.drawGrid(view.width, view.height, scale);
 
     // Buildings: filled rectangular footprints with a label when zoomed in enough.
     this.drawBuildings(view.buildings, scale);
 
-    // Trees: static green squares.
-    ctx.fillStyle = '#2ea043';
+    // Trees: static squares in the village's vegetation colour.
+    ctx.fillStyle = (view.palette ?? DEFAULT_TERRAIN_PALETTE).vegetation;
     const treeSize = Math.max(2, scale);
     for (const tree of view.trees) {
       ctx.fillRect(
@@ -256,11 +287,26 @@ export class Renderer {
     // Gatherings: a soft hull + label around each cluster of 2+ villagers.
     this.drawGatherings(view, scale);
 
-    // Villagers: colored circles, with a faint line to their current target.
+    // Villagers: layered procedural figures, with a faint line to their target.
+    // First work out the visual fan-out for any that are standing on top of one
+    // another, so each draws in its own spot (their true positions are untouched).
     const villagerRadius = Math.max(3, scale * 1.5);
+    this.computeFanOffsets(view, scale, villagerRadius);
     for (const villager of view.villagers) {
-      const ax = villager.position.x * scale + this.panX;
-      const ay = villager.position.y * scale + this.panY;
+      const { x: ax, y: ay } = this.fanScreen(villager, scale);
+
+      // When fanned out, tether the figure back to its true spot so the spread
+      // reads as "they're really all here", not as them having walked apart.
+      const off = this.fanOffsets.get(villager.id);
+      if (off && (off.dx !== 0 || off.dy !== 0)) {
+        ctx.strokeStyle = 'rgba(201, 209, 217, 0.22)';
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(villager.position.x * scale + this.panX, villager.position.y * scale + this.panY);
+        ctx.lineTo(ax, ay);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
 
       if (villager.target) {
         ctx.strokeStyle = 'rgba(201, 209, 217, 0.35)';
@@ -270,20 +316,27 @@ export class Renderer {
         ctx.stroke();
       }
 
-      // Body: a filled disc with a dark outline, plus a small lighter "head"
-      // notch so a villager reads as a little figure rather than a flat dot.
-      ctx.fillStyle = villager.color;
-      ctx.beginPath();
-      ctx.arc(ax, ay, villagerRadius, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(13, 17, 23, 0.8)';
-      ctx.lineWidth = Math.max(1, villagerRadius * 0.18);
-      ctx.stroke();
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-      ctx.beginPath();
-      ctx.arc(ax, ay - villagerRadius * 0.32, villagerRadius * 0.42, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.lineWidth = 1;
+      // Selected villager: a bright ring UNDER the body, so you can see whose mind
+      // you're reading without the ring covering the figure.
+      if (villager.id === this.selectedId) {
+        ctx.strokeStyle = '#f0f6fc';
+        ctx.lineWidth = Math.max(1.5, villagerRadius * 0.35);
+        ctx.beginPath();
+        ctx.arc(ax, ay, villagerRadius * 1.35, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      }
+
+      // The figure itself: a distinct little body/head/hair/hat/tool built from the
+      // villager's generated look (or a deterministic one for older saves).
+      drawVillagerSprite(
+        ctx,
+        ax,
+        ay,
+        villagerRadius,
+        villager.appearance ?? deriveAppearance(villager.id, villager.color),
+        { dim: villager.asleep },
+      );
 
       // Asleep: a little floating "💤" that gently bobs above the body, so a
       // sleeping villager (whose mind is dark) reads at a glance on the map.
@@ -293,18 +346,8 @@ export class Renderer {
         ctx.font = `${Math.max(12, villagerRadius * 1.2)}px system-ui, -apple-system, sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
-        ctx.fillText('💤', ax + villagerRadius * 0.9, ay - villagerRadius - 2 + bob);
+        ctx.fillText('💤', ax + villagerRadius * 1.2, ay - villagerRadius * 1.8 + bob);
         ctx.restore();
-      }
-
-      // Selected villager: a bright ring so you can see whose mind you're reading.
-      if (villager.id === this.selectedId) {
-        ctx.strokeStyle = '#f0f6fc';
-        ctx.lineWidth = Math.max(1.5, villagerRadius * 0.35);
-        ctx.beginPath();
-        ctx.arc(ax, ay, villagerRadius + ctx.lineWidth, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.lineWidth = 1;
       }
     }
 
@@ -497,6 +540,17 @@ export class Renderer {
         ctx.lineTo(cart.target.x * scale + this.panX, cart.target.y * scale + this.panY);
         ctx.stroke();
         ctx.setLineDash([]);
+      }
+
+      // A located cart (clicked in the depot fleet list) gets a bright pulsing halo
+      // so the eye lands on it after the camera centres.
+      if (cart.id === this.focusCartId) {
+        const pulse = 0.55 + 0.25 * Math.sin(Date.now() / 200);
+        ctx.beginPath();
+        ctx.arc(cx, cy, half * 2.2, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(245, 197, 66, ${pulse})`;
+        ctx.lineWidth = Math.max(2, half * 0.3);
+        ctx.stroke();
       }
 
       // Body: a rounded rectangle in the tier colour, dark outline; a red ring when
@@ -754,6 +808,55 @@ export class Renderer {
     }
   }
 
+  /**
+   * Paint the themed ground inside the world bounds: a solid base fill, then a
+   * scatter of soft accent blotches for texture (a flat slab of one colour reads as
+   * dead; the mottling makes it look like land). The blotch layout is DETERMINISTIC
+   * — derived from a fixed hash of the world size — so it doesn't shimmer frame to
+   * frame, and it's cheap (a few dozen ovals). Colours come from the village's
+   * palette, falling back to the default grassy one for worlds that carry none.
+   */
+  private drawGround(view: WorldView, scale: number): void {
+    const { ctx } = this;
+    const palette = view.palette ?? DEFAULT_TERRAIN_PALETTE;
+
+    const x0 = this.panX;
+    const y0 = this.panY;
+    const w = view.width * scale;
+    const h = view.height * scale;
+
+    // Base fill.
+    ctx.fillStyle = palette.ground;
+    ctx.fillRect(x0, y0, w, h);
+
+    // Accent blotches. Spacing in WORLD cells so density holds across zoom levels;
+    // a deterministic hash jitters each blotch's offset, size and presence.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0, y0, w, h); // clip so blotches never spill past the world edge
+    ctx.clip();
+    ctx.fillStyle = palette.groundAccent;
+    ctx.globalAlpha = 0.5;
+    const spacing = 28; // world cells between blotch centres
+    const cols = Math.ceil(view.width / spacing);
+    const rows = Math.ceil(view.height / spacing);
+    for (let gy = 0; gy <= rows; gy++) {
+      for (let gx = 0; gx <= cols; gx++) {
+        const seed = hash2(gx, gy);
+        if ((seed & 0xff) < 90) continue; // ~35% of cells stay bare base colour
+        const jx = ((seed >>> 8) & 0xff) / 255 - 0.5;
+        const jy = ((seed >>> 16) & 0xff) / 255 - 0.5;
+        const cx = (gx + 0.5 + jx) * spacing;
+        const cy = (gy + 0.5 + jy) * spacing;
+        const rad = (6 + ((seed >>> 24) & 0x7)) * scale; // 6..13 cells
+        ctx.beginPath();
+        ctx.ellipse(cx * scale + x0, cy * scale + y0, rad, rad * 0.7, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
   private drawGrid(width: number, height: number, scale: number): void {
     const { ctx } = this;
     ctx.strokeStyle = 'rgba(48, 54, 61, 0.6)';
@@ -857,6 +960,26 @@ export class Renderer {
   }
 
   /**
+   * Locate a cart on the map: centre the camera on it and flash a highlight ring for
+   * a few seconds so the eye finds it. Used by the depot fleet list ("click to
+   * locate") since carts roam and can be anywhere in the village.
+   */
+  focusCart(cartId: string): void {
+    const cart = this.net.getState().carts.find((c) => c.id === cartId);
+    if (!cart) return;
+    const scale = this.scale;
+    // Centre the cart in the viewport (screen = world * scale + pan).
+    this.panX = this.cssWidth / 2 - (cart.position.x + cart.width / 2) * scale;
+    this.panY = this.cssHeight / 2 - (cart.position.y + cart.height / 2) * scale;
+    this.focusCartId = cartId;
+    if (this.focusCartTimer) clearTimeout(this.focusCartTimer);
+    this.focusCartTimer = setTimeout(() => {
+      this.focusCartId = null;
+      this.focusCartTimer = null;
+    }, 3000);
+  }
+
+  /**
    * Record what a villager just decided to do, so a bubble pops up above it. Fed
    * the same thought stream as the inspector — every time a mind answers the
    * LLM, the villager visibly says/does it on the map.
@@ -940,6 +1063,67 @@ export class Renderer {
    * at a glance — no clicking required. Fixed screen size; villagers that are
    * close together at low zoom will overlap until you zoom in.
    */
+  /**
+   * Recompute the per-frame fan-out offsets. Villagers whose drawn bodies would
+   * overlap are grouped (a simple union-by-proximity), then each group is spread
+   * evenly around a small ring about its centroid. Purely visual: the backend
+   * positions are untouched; we only store a screen offset per id. Determined by
+   * sorting each group by id so the layout is stable frame to frame (no jitter).
+   */
+  private computeFanOffsets(view: WorldView, scale: number, radius: number): void {
+    this.fanOffsets.clear();
+    const vs = view.villagers;
+    const n = vs.length;
+    if (n < 2) return;
+
+    const px = vs.map((v) => v.position.x * scale + this.panX);
+    const py = vs.map((v) => v.position.y * scale + this.panY);
+
+    // Union-find to cluster villagers whose bodies sit within touching distance.
+    const parent = vs.map((_, i) => i);
+    const find = (a: number): number => {
+      while (parent[a] !== a) { parent[a] = parent[parent[a]!]!; a = parent[a]!; }
+      return a;
+    };
+    const touch = radius * 2.2;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (Math.hypot(px[i]! - px[j]!, py[i]! - py[j]!) < touch) parent[find(i)] = find(j);
+      }
+    }
+    const groups = new Map<number, number[]>();
+    for (let i = 0; i < n; i++) {
+      const root = find(i);
+      (groups.get(root) ?? groups.set(root, []).get(root)!).push(i);
+    }
+
+    for (const idxs of groups.values()) {
+      if (idxs.length < 2) continue;
+      // Stable order so a given villager keeps its slot on the ring across frames.
+      idxs.sort((a, b) => (vs[a]!.id < vs[b]!.id ? -1 : 1));
+      const k = idxs.length;
+      const cx = idxs.reduce((s, i) => s + px[i]!, 0) / k;
+      const cy = idxs.reduce((s, i) => s + py[i]!, 0) / k;
+      // Ring big enough that neighbours on it clear each other's bodies.
+      const ring = Math.max(radius * 1.5, (radius * 1.25) / Math.sin(Math.PI / k));
+      idxs.forEach((i, m) => {
+        const ang = (2 * Math.PI * m) / k - Math.PI / 2;
+        const tx = cx + ring * Math.cos(ang);
+        const ty = cy + ring * Math.sin(ang);
+        this.fanOffsets.set(vs[i]!.id, { dx: (tx - px[i]!) / scale, dy: (ty - py[i]!) / scale });
+      });
+    }
+  }
+
+  /** A villager's on-screen pixel position, including any fan-out offset. */
+  private fanScreen(villager: Villager, scale: number): { x: number; y: number } {
+    const off = this.fanOffsets.get(villager.id);
+    return {
+      x: (villager.position.x + (off?.dx ?? 0)) * scale + this.panX,
+      y: (villager.position.y + (off?.dy ?? 0)) * scale + this.panY,
+    };
+  }
+
   private drawVillagerCards(view: WorldView, scale: number, radius: number): void {
     if (view.villagers.length === 0) return;
     const { ctx } = this;
@@ -949,10 +1133,10 @@ export class Renderer {
 
     for (const villager of view.villagers) {
       if (!villager.needs) continue; // defensive: pre-stats payload
-      const ax = villager.position.x * scale + this.panX;
-      const ay = villager.position.y * scale + this.panY;
+      const { x: ax, y: ay } = this.fanScreen(villager, scale);
       const x = ax - CARD_W / 2;
-      const y = ay - radius - CARD_GAP - CARD_HEIGHT;
+      // Clear the full figure (head + hat reach ~1.9 body-radii above the torso).
+      const y = ay - radius * 1.9 - CARD_GAP - CARD_HEIGHT;
       const selected = villager.id === this.selectedId;
 
       // Panel.
@@ -1082,8 +1266,7 @@ export class Renderer {
       const villager = view.villagers.find((v) => v.id === id);
       if (!villager) continue;
 
-      const ax = villager.position.x * scale + this.panX;
-      const ay = villager.position.y * scale + this.panY;
+      const { x: ax, y: ay } = this.fanScreen(villager, scale);
 
       // A status/action popup reads in italics; speech is upright. Set the font
       // before measuring so wrapping accounts for the right metrics.
@@ -1096,7 +1279,7 @@ export class Renderer {
       const boxH = lines.length * lineH + padY * 2;
       const bx = ax - boxW / 2;
       // Sit above the always-on stat card so the two never overlap.
-      const by = ay - radius - CARD_GAP - CARD_HEIGHT - 6 - boxH;
+      const by = ay - radius * 1.9 - CARD_GAP - CARD_HEIGHT - 6 - boxH;
 
       // Ease out over the final stretch so bubbles dissolve instead of blinking.
       ctx.globalAlpha = Math.min(1, (bubble.until - now) / BUBBLE_FADE_MS);
@@ -1170,8 +1353,10 @@ export class Renderer {
   }
 
   /**
-   * The villager whose drawn circle contains the given CSS-pixel point, or null.
-   * Uses a slightly generous radius so small dots stay clickable when zoomed out.
+   * The villager whose drawn figure contains the given CSS-pixel point, or null.
+   * Hit-tests the FANNED-OUT screen position (the same offset the body is drawn
+   * with) so spread-apart villagers in a pile each stay individually clickable,
+   * with a slightly generous radius so small figures stay clickable when zoomed out.
    */
   private villagerAtPixel(cssX: number, cssY: number, view: WorldView): Villager | null {
     const scale = this.scale;
@@ -1179,8 +1364,7 @@ export class Renderer {
     let best: Villager | null = null;
     let bestDist = hitRadius;
     for (const villager of view.villagers) {
-      const ax = villager.position.x * scale + this.panX;
-      const ay = villager.position.y * scale + this.panY;
+      const { x: ax, y: ay } = this.fanScreen(villager, scale);
       const dist = Math.hypot(cssX - ax, cssY - ay);
       if (dist <= bestDist) {
         best = villager;
@@ -1245,6 +1429,12 @@ function bubbleText(decision: AgentDecision | null): string | null {
       return `🏗️ build ${decision.name}`;
     case 'command_cart':
       return `🛒 cart: ${decision.resource}`;
+    case 'add_to_agenda':
+      return `📅 ${decision.title}`;
+    case 'propose_event':
+      return `📣 ${decision.title}`;
+    case 'accept_event':
+      return `✅ joining the gathering`;
     case 'move_to':
       return null;
   }

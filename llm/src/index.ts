@@ -8,10 +8,14 @@
  * work here, and the engine serializes it so the single server is never
  * dog-piled. Run exactly one.
  *
- * Endpoints (all POST, JSON in/out):
- *   /decide   { system, userMessage, tools }  -> LLMDecision { call, raw }
+ * Endpoints (all POST):
+ *   /decide   { messages, tools } (or legacy { system, userMessage, tools })
+ *                                              -> SSE: `delta`* then `done` { turn | decision }
  *   /complete { system, user }                 -> { text }
  *   /embed    { texts: string[] }              -> { vectors: number[][] }
+ *   /models   (GET)                            -> LlmModelConfig { current, available }
+ *   /model    { model }                        -> LlmModelConfig { current, available }
+ *   /pool     (GET)                            -> LlmPoolConfig { endpoints, capacity, defaultModel }
  *   /health   (GET)                            -> "ok"
  * ---------------------------------------------------------------------------
  */
@@ -54,6 +58,16 @@ async function handle(
     res.end('ok\n');
     return;
   }
+  // The current chat model + the models the backend can serve (discovered live).
+  if (req.method === 'GET' && req.url === '/models') {
+    sendJson(res, 200, await engine.getModelConfig());
+    return;
+  }
+  // The pool's shape: its endpoints, live busy flags, and parallel capacity.
+  if (req.method === 'GET' && req.url === '/pool') {
+    sendJson(res, 200, engine.getPoolConfig());
+    return;
+  }
   if (req.method !== 'POST') {
     sendJson(res, 405, { error: 'method not allowed' });
     return;
@@ -62,7 +76,7 @@ async function handle(
   const body = await readJson(req);
   switch (req.url) {
     case '/decide':
-      sendJson(res, 200, await engine.decide(body));
+      await streamDecide(engine, body, res);
       return;
     case '/complete':
       sendJson(res, 200, { text: await engine.synthesize(body) });
@@ -70,8 +84,60 @@ async function handle(
     case '/embed':
       sendJson(res, 200, { vectors: await engine.embed(body.texts ?? []) });
       return;
+    case '/model': {
+      // Switch the global chat model, then echo back the (re-discovered) config.
+      if (typeof body.model !== 'string' || !body.model) {
+        sendJson(res, 400, { error: 'body.model (non-empty string) is required' });
+        return;
+      }
+      sendJson(res, 200, await engine.setModel(body.model));
+      return;
+    }
     default:
       sendJson(res, 404, { error: `unknown endpoint ${req.url}` });
+  }
+}
+
+/**
+ * Run a decision and STREAM it back as Server-Sent Events: one `delta` frame per
+ * output slice the model emits, then a terminal `done` frame carrying the full
+ * {@link LLMDecision} (or an `error` frame if the call fails outright). The
+ * backend's `HttpLLMClient` consumes this and re-publishes the deltas onto the
+ * telemetry bus for the Live LLM window. Errors are written into the stream
+ * rather than thrown, since the SSE headers are already on the wire.
+ */
+async function streamDecide(
+  engine: LlamaEngine,
+  body: any,
+  res: ServerResponse,
+): Promise<void> {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+  });
+  const send = (payload: unknown): void => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+  try {
+    if (Array.isArray(body?.messages)) {
+      // Agentic path: one assistant turn over a transcript, with native tool-calling.
+      const turn = await engine.converseStream(
+        body.messages,
+        body.tools ?? [],
+        body.route,
+        (chunk) => send({ type: 'delta', ...chunk }),
+      );
+      send({ type: 'done', turn });
+    } else {
+      // Legacy single-decision path (system + userMessage + tools).
+      const decision = await engine.decideStream(body, (chunk) => send({ type: 'delta', ...chunk }));
+      send({ type: 'done', decision });
+    }
+  } catch (err) {
+    send({ type: 'error', error: errMsg(err) });
+  } finally {
+    res.end();
   }
 }
 

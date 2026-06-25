@@ -22,11 +22,12 @@ export interface LlamaSynthesizerOptions {
   /** Sampling temperature. Reflection wants a little creativity. Default 0.7. */
   temperature?: number;
   /**
-   * Cap on synthesized length. Default 1024 tokens — generous on purpose: a
-   * REASONING model (e.g. Nemotron Nano, DeepSeek-R1) spends tokens thinking
-   * before it writes, and a tight cap leaves it no room to produce visible
-   * content after the thinking, so the completion comes back empty. The headroom
-   * costs nothing for non-reasoning models (they stop at the stop token).
+   * Cap on synthesized length. Defaults to `LLAMA_SYNTH_MAX_TOKENS`, else the global
+   * `LLM_MAX_TOKENS`, else 1024 — generous on purpose: a REASONING model (e.g.
+   * Nemotron Nano, DeepSeek-R1) spends tokens thinking before it writes, and a tight
+   * cap leaves it no room to produce visible content after the thinking, so the
+   * completion comes back empty. The headroom costs nothing for non-reasoning models
+   * (they stop at the stop token).
    */
   maxTokens?: number;
 }
@@ -49,7 +50,8 @@ export class LlamaSynthesizer implements Synthesizer {
   readonly name = 'llama-synth';
 
   private readonly urls: string[];
-  private readonly model: string;
+  /** Chat model tag. Mutable so the engine can keep it in step with the decider's model. */
+  private model: string;
   private readonly apiKey: string | undefined;
   private readonly timeoutMs: number;
   private readonly temperature: number;
@@ -63,7 +65,22 @@ export class LlamaSynthesizer implements Synthesizer {
     this.apiKey = options.apiKey ?? process.env.LLAMA_API_KEY;
     this.timeoutMs = options.timeoutMs ?? Number(process.env.LLAMA_TIMEOUT_MS ?? 30_000);
     this.temperature = options.temperature ?? 0.7;
-    this.maxTokens = options.maxTokens ?? Number(process.env.LLAMA_SYNTH_MAX_TOKENS ?? 1024);
+    // Priority: explicit option > synth-specific LLAMA_SYNTH_MAX_TOKENS > global
+    // LLM_MAX_TOKENS > 1024. (A per-request `maxTokens` still overrides all of these
+    // at call time — see callServer.)
+    this.maxTokens =
+      options.maxTokens ??
+      Number(process.env.LLAMA_SYNTH_MAX_TOKENS ?? process.env.LLM_MAX_TOKENS ?? 1024);
+  }
+
+  /** The model tag reflection/planning prose currently runs against. */
+  getModel(): string {
+    return this.model;
+  }
+
+  /** Switch the chat model used from the next completion onward. */
+  setModel(model: string): void {
+    this.model = model;
   }
 
   async synthesize(request: SynthesisRequest): Promise<string> {
@@ -99,7 +116,9 @@ export class LlamaSynthesizer implements Synthesizer {
           model: this.model,
           stream: false,
           temperature: this.temperature,
-          max_tokens: this.maxTokens,
+          // A caller may raise the cap for a big structured answer on a thinking
+          // model (see SynthesisRequest.maxTokens); otherwise use the default.
+          max_tokens: request.maxTokens ?? this.maxTokens,
           messages: [
             { role: 'system', content: request.system },
             { role: 'user', content: request.user },

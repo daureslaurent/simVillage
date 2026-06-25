@@ -25,6 +25,9 @@ export interface WorldStore {
   /** Upsert the latest live snapshot (called periodically from the tick loop). */
   saveSnapshot(snapshot: WorldSeed): Promise<void>;
 
+  /** Delete the persisted world entirely, so the next boot starts fresh (the "New Village" reset). */
+  clear(): Promise<void>;
+
   /** Close the underlying connection. */
   close(): Promise<void>;
 }

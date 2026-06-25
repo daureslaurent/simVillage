@@ -15,7 +15,7 @@
  * ---------------------------------------------------------------------------
  */
 
-import type { BuildingEvent, GroupPlan, Relationship } from '../../../shared/types';
+import type { AgendaEvent, AgendaNote, BuildingEvent, GroupPlan, Relationship, VillageVision } from '../../../shared/types';
 import type { CharacterProfile } from '../profile';
 import type { MapEntry, Perception } from '../sensory';
 import type { PlanBlock } from '../planning/DailyPlanner';
@@ -38,14 +38,8 @@ export interface TurnInputs {
   planBlock?: PlanBlock | null;
   /** The day's overall theme, if a plan exists. */
   planTheme?: string | null;
-  /** The village's shared gathering place, to steer a lone villager toward company. */
+  /** The village's shared gathering place, named as a fact when the villager is alone. */
   socialHub?: SocialHub | null;
-  /**
-   * Push the mind to ACT this turn rather than talk: set when it carries a haul but
-   * has stalled in conversation (see AgentService's commitment guard). Adds a
-   * directive to deliver/act on its plan; `say` is also withheld from its tools.
-   */
-  commitToAction?: boolean;
   /** The whole-village layout, so the per-turn prompt can name where every place is. */
   villageMap?: MapEntry[];
   /** Recent activity of buildings in sensing range, keyed by building id. */
@@ -55,12 +49,20 @@ export interface TurnInputs {
    * malformed call), if anything. Surfaced so the mind self-corrects this turn.
    */
   lastSkippedReason?: string | null;
-  /** True once the villager has been with the same company a while (conversation warm). */
-  groupWarm?: boolean;
   /** The shared plan this villager is already a member of, if any. */
   groupPlan?: GroupPlan | null;
   /** A plan its current company is forming that it could join, if any. */
   joinablePlan?: GroupPlan | null;
+  /** Scheduled events this villager is attending (personal or shared), soonest first. */
+  agendaEvents?: AgendaEvent[];
+  /** Events this villager has been invited to but not yet accepted, soonest first. */
+  agendaInvited?: AgendaEvent[];
+  /** This villager's untimed agenda notes, newest first. */
+  agendaNotes?: AgendaNote[];
+  /** The village's shared vision (ambition + named stage + milestones), if known. */
+  villageVision?: VillageVision | null;
+  /** Salient things that happened around the villager since it last acted, newest last. */
+  recentEvents?: string[];
 }
 
 export class PromptAssembler {
@@ -89,13 +91,16 @@ export class PromptAssembler {
       planBlock: inputs.planBlock ?? null,
       planTheme: inputs.planTheme ?? null,
       socialHub: inputs.socialHub ?? null,
-      commitToAction: inputs.commitToAction ?? false,
       villageMap: inputs.villageMap ?? [],
       buildingActivity: inputs.buildingActivity ?? {},
       lastSkippedReason: inputs.lastSkippedReason ?? null,
-      groupWarm: inputs.groupWarm ?? false,
       groupPlan: inputs.groupPlan ?? null,
       joinablePlan: inputs.joinablePlan ?? null,
+      agendaEvents: inputs.agendaEvents ?? [],
+      agendaInvited: inputs.agendaInvited ?? [],
+      agendaNotes: inputs.agendaNotes ?? [],
+      villageVision: inputs.villageVision ?? null,
+      recentEvents: inputs.recentEvents ?? [],
     });
   }
 

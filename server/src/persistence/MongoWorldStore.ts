@@ -65,6 +65,11 @@ export class MongoWorldStore implements WorldStore {
     await this.upsert(snapshot);
   }
 
+  async clear(): Promise<void> {
+    await this.requireCollection().deleteOne({ _id: WORLD_ID });
+    console.log('[mongo] world document cleared');
+  }
+
   async close(): Promise<void> {
     await this.client.close();
   }

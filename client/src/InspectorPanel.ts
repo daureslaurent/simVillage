@@ -15,7 +15,7 @@
  * ---------------------------------------------------------------------------
  */
 
-import type { VillagerThoughtMessage } from '../../shared/types';
+import type { AgentTraceStep, VillagerThoughtMessage } from '../../shared/types';
 import type { ManagedWindow } from './WindowManager';
 
 export interface InspectorOptions {
@@ -120,16 +120,27 @@ export class InspectorPanel {
     const entry = document.createElement('div');
     entry.className = 'thought';
 
-    const decision = t.decision ? `${t.decision.kind}` : '— (skipped)';
+    const steps = t.steps ?? [];
+    const headline = steps.length > 0 ? summariseSteps(steps) : t.decision ? t.decision.kind : '— (skipped)';
     const memories = t.recalledMemories.length
       ? t.recalledMemories
           .map((m) => `  · [${m.kind} ${m.score.toFixed(2)}] ${escapeHtml(m.text)}`)
           .join('\n')
       : '  (none recalled)';
 
+    // The agentic TRACE: the chain of lookups + actions the mind ran this turn.
+    const traceSec =
+      steps.length > 0
+        ? `<details class="thought__sec thought__sec--trace" open>
+             <summary>reasoning trace (${steps.length} step${steps.length === 1 ? '' : 's'})</summary>
+             <div class="trace">${steps.map(renderStep).join('')}</div>
+           </details>`
+        : '';
+
     entry.innerHTML = `
-      <div class="thought__meta">tick ${t.tick} → <b>${escapeHtml(decision)}</b></div>
-      <details class="thought__sec" open>
+      <div class="thought__meta">tick ${t.tick} → <b>${escapeHtml(headline)}</b></div>
+      ${traceSec}
+      <details class="thought__sec"${steps.length > 0 ? '' : ' open'}>
         <summary>recalled memories (${t.recalledMemories.length})</summary>
         <pre>${memories}</pre>
       </details>
@@ -159,6 +170,28 @@ export class InspectorPanel {
       this.thoughtsEl.lastElementChild?.remove();
     }
   }
+}
+
+/** A one-line headline for the turn: how many lookups + actions the mind ran. */
+function summariseSteps(steps: AgentTraceStep[]): string {
+  const actions = steps.filter((s) => s.kind === 'action' && s.committed).map((s) => s.tool);
+  const reads = steps.filter((s) => s.kind === 'read').length;
+  const readBit = reads > 0 ? `${reads} lookup${reads === 1 ? '' : 's'}` : '';
+  const actBit = actions.length > 0 ? actions.join(' → ') : 'no action';
+  return [readBit, actBit].filter(Boolean).join(' · ');
+}
+
+/** Render one trace step as a row: a kind glyph, the tool, its input, and the result fed back. */
+function renderStep(s: AgentTraceStep): string {
+  const glyph = s.kind === 'read' ? '🔍' : s.kind === 'action' ? (s.committed ? '⚙️' : '⚠️') : '✓';
+  const tool = s.tool ? `<span class="trace__tool">${escapeHtml(s.tool)}</span>` : '<span class="trace__tool">yield</span>';
+  const input = s.input ? `<span class="trace__in">${escapeHtml(s.input)}</span>` : '';
+  const thought = s.thought ? `<div class="trace__thought">${escapeHtml(s.thought)}</div>` : '';
+  const result = s.result ? `<div class="trace__result">${escapeHtml(s.result)}</div>` : '';
+  return `<div class="trace__step trace__step--${s.kind}${s.kind === 'action' && !s.committed ? ' trace__step--rejected' : ''}">
+      <div class="trace__head">${glyph} ${tool} ${input}</div>
+      ${thought}${result}
+    </div>`;
 }
 
 /** Minimal HTML-escape so memory/prompt text can't inject markup. */

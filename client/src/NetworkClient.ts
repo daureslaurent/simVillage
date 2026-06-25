@@ -21,14 +21,27 @@ import type {
   Building,
   Cart,
   LlmCallStartedMessage,
+  LlmCallDeltaMessage,
   LlmCallFinishedMessage,
   ServerMessage,
+  WorldGeneratingMessage,
+  WorldNeedsSetupMessage,
+  WorldStylePreviewMessage,
+  VillageSize,
   SupervisorActionMessage,
+  SupervisorDailyReportMessage,
   SupervisorPrayerMessage,
   RelationshipUpdateMessage,
   GroupPlanMessage,
+  AgendaItem,
   Tree,
+  TerrainPalette,
   WeatherKind,
+  ReasoningEffortSettings,
+  EffortPurpose,
+  ReasoningEffort,
+  LlmModelConfig,
+  LlmPoolConfig,
 } from '../../shared/types';
 
 /** A flattened, latest-known snapshot the renderer can draw directly. */
@@ -46,6 +59,8 @@ export interface WorldView {
   weather: WeatherKind;
   /** Social clusters of 2+ nearby villagers this tick. */
   gatherings: Gathering[];
+  /** Themed ground colours from world.init (null until the first init; default if the world has none). */
+  palette: TerrainPalette | null;
 }
 
 export class NetworkClient {
@@ -64,6 +79,7 @@ export class NetworkClient {
     carts: [],
     weather: 'clear',
     gatherings: [],
+    palette: null,
   };
 
   /** Optional hook so the UI can react to connection state changes. */
@@ -82,18 +98,46 @@ export class NetworkClient {
   onSimTick: ((tick: number, acting: string[], cooldown: Record<string, number>) => void) | null = null;
   /** Optional hook fired when an LLM-engine round-trip starts (debug window). */
   onEngineCallStarted: ((call: LlmCallStartedMessage) => void) | null = null;
+  /** Optional hook fed each streamed slice of an in-flight `/decide` call (Live LLM window). */
+  onEngineCallDelta: ((call: LlmCallDeltaMessage) => void) | null = null;
   /** Optional hook fired when an LLM-engine round-trip finishes (debug window). */
   onEngineCallFinished: ((call: LlmCallFinishedMessage) => void) | null = null;
   /** Optional hook fed each villager prayer, for the Supervisor (temple) console. */
   onPrayer: ((prayer: SupervisorPrayerMessage) => void) | null = null;
   /** Optional hook fed each divine act the Supervisor took, for the console's log. */
   onSupervisorAction: ((action: SupervisorActionMessage) => void) | null = null;
+  /** Optional hook fed the god's nightly chronicle, for the summary window. */
+  onDailyReport: ((message: SupervisorDailyReportMessage) => void) | null = null;
   /** Optional hook fed each villager's revised social book, for the relationships view. */
   onRelationship: ((message: RelationshipUpdateMessage) => void) | null = null;
   /** Optional hook fed each opened/joined group plan, for the shared-plans view. */
   onGroupPlan: ((message: GroupPlanMessage) => void) | null = null;
+  /** Optional hook fed each created/changed agenda item, for the Agenda view. */
+  onAgendaUpdate: ((item: AgendaItem) => void) | null = null;
+  /** Optional hook fed the id of each dropped agenda item (expired event / stale note). */
+  onAgendaRemoved: ((itemId: string) => void) | null = null;
   /** Optional hook fed the current village weather (on connect and on every change). */
   onWeather: ((weather: WeatherKind) => void) | null = null;
+  /**
+   * Optional hook fed an LLM-generated village's flavour (theme label + a sentence)
+   * on `world.init`. Fires with empty strings for the classic hand-authored village,
+   * so a listener can hide the theme chip when there is none.
+   */
+  onTheme: ((theme: string, setting: string) => void) | null = null;
+  /** Optional hook fed each world-generation progress step, for the loading overlay. */
+  onGenerating: ((message: WorldGeneratingMessage) => void) | null = null;
+  /** Optional hook fired once `world.init` arrives, so the loading overlay can dismiss. */
+  onWorldInit: (() => void) | null = null;
+  /** Optional hook fired when the backend is awaiting the first-run setup choice. */
+  onNeedsSetup: ((message: WorldNeedsSetupMessage) => void) | null = null;
+  /** Optional hook fed a style colour preview answer, for the setup screen's swatch. */
+  onStylePreview: ((message: WorldStylePreviewMessage) => void) | null = null;
+  /** Optional hook fed the current reasoning-effort config (on connect and on every change). */
+  onReasoningEffort: ((settings: ReasoningEffortSettings) => void) | null = null;
+  /** Optional hook fed the current chat-model config (on connect and on every change/refresh). */
+  onLlmModel: ((config: LlmModelConfig) => void) | null = null;
+  /** Optional hook fed the LLM pool shape (endpoints + busy), on connect and on each poll. */
+  onLlmPool: ((config: LlmPoolConfig) => void) | null = null;
 
   constructor(private readonly url: string) {}
 
@@ -180,6 +224,36 @@ export class NetworkClient {
     this.sendCommand({ command: 'god_spawn', entityType, x, y });
   }
 
+  /** Settings: set how hard the model thinks for one call purpose. */
+  setReasoningEffort(purpose: EffortPurpose, level: ReasoningEffort): void {
+    this.sendCommand({ command: 'set_reasoning_effort', purpose, level });
+  }
+
+  /** Settings: switch the engine's global chat model. */
+  setLlmModel(model: string): void {
+    this.sendCommand({ command: 'set_llm_model', model });
+  }
+
+  /** Settings: ask the backend to re-discover available models from the engine. */
+  refreshLlmModels(): void {
+    this.sendCommand({ command: 'refresh_llm_models' });
+  }
+
+  /** Setup screen: create the village (auto-generate with a style, or the static village). */
+  generateWorld(opts: { mode: 'auto' | 'static'; style?: string; villagers?: number; size?: VillageSize }): void {
+    this.sendCommand({ command: 'generate_world', ...opts });
+  }
+
+  /** Setup screen: ask for a fast colour preview of a style (debounced by the caller). */
+  previewStyle(requestId: number, style: string): void {
+    this.sendCommand({ command: 'preview_style', requestId, style });
+  }
+
+  /** Settings: wipe the world and return to the setup screen ("New Village"). */
+  resetWorld(): void {
+    this.sendCommand({ command: 'reset_world' });
+  }
+
   // -------------------------------------------------------------------------
 
   private handleMessage(raw: unknown): void {
@@ -200,7 +274,20 @@ export class NetworkClient {
         this.view.trees = message.trees;
         this.view.buildings = message.buildings;
         this.view.weather = message.weather;
+        this.view.palette = message.palette ?? null;
         this.onWeather?.(message.weather);
+        this.onTheme?.(message.theme ?? '', message.setting ?? '');
+        // The world exists now: dismiss any generation overlay.
+        this.onWorldInit?.();
+        break;
+      case 'world.generating':
+        this.onGenerating?.(message);
+        break;
+      case 'world.needs_setup':
+        this.onNeedsSetup?.(message);
+        break;
+      case 'world.style_preview':
+        this.onStylePreview?.(message);
         break;
       case 'world.state_update':
         this.view.tick = message.tick;
@@ -233,6 +320,9 @@ export class NetworkClient {
       case 'engine.llm.started':
         this.onEngineCallStarted?.(message);
         break;
+      case 'engine.llm.delta':
+        this.onEngineCallDelta?.(message);
+        break;
       case 'engine.llm.finished':
         this.onEngineCallFinished?.(message);
         break;
@@ -242,11 +332,29 @@ export class NetworkClient {
       case 'supervisor.action':
         this.onSupervisorAction?.(message);
         break;
+      case 'supervisor.daily_report':
+        this.onDailyReport?.(message);
+        break;
       case 'relationship.updated':
         this.onRelationship?.(message);
         break;
       case 'group_plan.updated':
         this.onGroupPlan?.(message);
+        break;
+      case 'agenda.updated':
+        this.onAgendaUpdate?.(message.item);
+        break;
+      case 'agenda.removed':
+        this.onAgendaRemoved?.(message.itemId);
+        break;
+      case 'reasoning.effort':
+        this.onReasoningEffort?.(message.settings);
+        break;
+      case 'llm.pool':
+        this.onLlmPool?.(message.config);
+        break;
+      case 'llm.model':
+        this.onLlmModel?.(message.config);
         break;
       // No default needed: ServerMessage is a closed union.
     }

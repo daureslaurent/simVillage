@@ -23,11 +23,11 @@
  * ---------------------------------------------------------------------------
  */
 
-import type { BuildingEvent, BuildingKind, GroupPlan, Relationship, ResourceKind, VillagerNeeds } from '../../../shared/types';
+import type { AgendaEvent, AgendaNote, BuildingEvent, GroupPlan, Relationship, ResourceKind, VillageVision, VillagerNeeds } from '../../../shared/types';
 import { affinityWord } from '../social/RelationshipBook';
-import { BACKPACK_CAPACITY, isResourceKind } from '../../../shared/types';
-import { buildingConversion, buildingStockKinds, isSource, SERVICE_REACH } from '../../../shared/buildings';
-import { formatSimDateTime, SIM_SECONDS_PER_TICK } from '../../../shared/simClock';
+import { BACKPACK_CAPACITY } from '../../../shared/types';
+import { SERVICE_REACH } from '../../../shared/buildings';
+import { formatSimDateTime, simTimeFromTick, SIM_SECONDS_PER_TICK } from '../../../shared/simClock';
 import type { CharacterProfile } from '../profile';
 import type { MapEntry, PerceivedBuilding, Perception } from '../sensory';
 import type { PlanBlock } from '../planning/DailyPlanner';
@@ -111,7 +111,22 @@ function pressingNeed(needs: VillagerNeeds): string | null {
  * (EMPTY — needs refilling), food 31/50". Returns null for a building with no
  * resource economy, so the caller can omit a stock clause for those.
  */
-function describeStock(b: Pick<PerceivedBuilding, 'stock' | 'capacity' | 'empty'>): string | null {
+function describeStock(
+  b: Pick<PerceivedBuilding, 'stock' | 'capacity' | 'empty' | 'needs'>,
+): string | null {
+  // A construction site reads as a checklist of materials still to haul in, not as a
+  // store — so the mind sees exactly what to bring (or dispatch a cart for) to raise it.
+  if (b.needs) {
+    const kinds = Object.keys(b.needs) as ResourceKind[];
+    if (kinds.length === 0) return null;
+    return kinds
+      .map((r) => {
+        const have = Math.round(b.stock[r] ?? 0);
+        const need = b.needs![r] ?? 0;
+        return have >= need ? `${r} ${have}/${need} ✓` : `needs ${need - have} more ${r} (${have}/${need})`;
+      })
+      .join(', ');
+  }
   const kinds = Object.keys(b.stock) as ResourceKind[];
   if (kinds.length === 0) return null;
   const parts = kinds.map((r) => {
@@ -134,66 +149,41 @@ function summariseBackpack(backpack: string[]): string {
 // ===========================================================================
 
 /**
- * The PERSONA block: who this villager is and what it is presently trying to do.
- * Terse and declarative — over-prescriptive "YOU MUST" prompting causes
- * overtriggering; stating the role plainly works better.
+ * The PERSONA block: who this villager is. This is the SPINE of an emergent
+ * villager — behaviour is meant to flow from character, goal and memory reacting
+ * to what is around it, NOT from the turn prompt telling it what to do. So this
+ * block grants agency plainly: you are this person, you live as you see fit. Terse
+ * and declarative — over-prescriptive "YOU MUST" prompting causes overtriggering.
  */
 export function personaBlock(profile: CharacterProfile): string {
   const lines = [
-    `You are ${profile.name}, a villager living in the village described above.`,
-    `Your personality: ${profile.traits.join(', ')}.`,
-    `Your standing goal: ${profile.goal}`,
+    `You are ${profile.name}, a villager who lives in the village described above.`,
+    `Your character: ${profile.traits.join(', ')}.`,
+    `What you want: ${profile.goal}`,
   ];
-  if (profile.backstory) lines.push(`Background: ${profile.backstory}`);
+  if (profile.backstory) lines.push(`Your past: ${profile.backstory}`);
+  lines.push(
+    '',
+    'You are your own person. No one tells you what to do each moment — you decide,',
+    'in character, from what you want and what is happening around you. Live this life',
+    'as you see fit.',
+  );
   return lines.join('\n');
 }
 
 /**
- * The ACTION CONTRACT block: the one rule of acting (one tool per turn) and a
- * one-line guide to each tool. The WORLD's rules (needs, sources vs. markets, the
- * day's rhythm) are in the bible, not here — this only covers HOW you act.
+ * The ACTION CONTRACT block: the bare MECHANICS of acting — not what to do. Each
+ * tool carries its own description (sent with the schemas), so this only states the
+ * rules of the interface and leaves the CHOICE entirely to the villager. Deliberately
+ * free of "you should": the behaviour is meant to emerge from character + situation,
+ * not from a priority list handed down here.
  */
 export function actionContractBlock(): string {
   return [
-    'Each turn you take exactly one action by calling one tool. You sense only what',
-    'is within a few tiles of you; act on a villager or object only once it is near.',
-    '',
-    'Your tools:',
-    '- consult_map: recall the whole village layout — every building, what it is for,',
-    '  and its centre tile. Use it to head somewhere you cannot currently see (the',
-    '  spring, the grove, Greenfield, the Forge, Hall Town, the Inn). It does not move',
-    '  you; you then choose your action.',
-    '- move_to: walk toward a tile (x, y). Wander, explore, head to a building from',
-    '  the map, or approach a neighbour or object before dealing with it.',
-    '- say: speak out loud to everyone near you at once — this is how a group talks',
-    '  together. Only meaningful when someone is within earshot this turn. Keep it',
-    '  brief; if others just spoke, reply to what they actually said; do not greet them',
-    '  again as if you had not heard.',
-    '- reason: think privately to yourself — no one hears it and it does not move you.',
-    '  Use it to decide what to do next, especially when a conversation is going in',
-    '  circles: stop talking, reason out your plan, then carry it out on your next turn.',
-    '- interact_with: use a nearby object (use its exact id).',
-    '- work_at: work a converter — farm Greenfield (water→food) or the Forge (wood→',
-    '  goods); you will walk there if needed and keep at it until its output is full',
-    '  or its input runs out.',
-    '- take_from: load water/food/wood/goods/stone from a building into your backpack (stand next to it).',
-    '- give_to: drop a carried resource into a building, or stone/wood into a building site to raise it (stand next to it).',
-    '- pray_at: pray at the temple to petition the Supreme God (stand next to it).',
-    '  Speak your petition in the prayer — ask aloud for what the village needs; the',
-    '  god hears every prayer offered at the temple and may answer by reshaping the world.',
-    '- propose_plan: when gathered with others, propose a shared plan — a common goal',
-    '  and the part you will take (kind: work, prayer, or social). This turns talk into',
-    '  coordinated doing; the others can join. Better than agreeing to a chore aloud yet',
-    '  again — propose it, then go do your part.',
-    '- join_plan: throw in with the plan your group is forming, taking on a role, then',
-    '  go and do it.',
-    '- propose_build: rally the village to RAISE something lasting — a house, a well, a',
-    '  statue, or a lamp. It opens a building site you and your neighbours haul stone',
-    '  (and a little wood/goods) to until it is finished. Best when the stores are full',
-    '  and you are with others who can help.',
-    '',
-    'Stay in character. Choose one tool every turn. Talk is cheap — when a gathering has',
-    'agreed on something, turn it into a plan or an action rather than repeating it.',
+    'You act in the world by calling exactly ONE tool each turn. You sense only what is',
+    'within a few tiles of you, and can act on a place, neighbour, or object only once it',
+    'is near. The tools available to you, with their arguments, are listed for you.',
+    'What you do with them is your own choice.',
   ].join('\n');
 }
 
@@ -298,22 +288,14 @@ function bodyBlock(perception: Perception): string[] {
     sensingPhrase(perception),
     `You are ${self.idle ? 'standing still' : 'currently walking somewhere'} (${self.status}).`,
     '',
-    'Your body right now:',
-    `- Hunger: ${needWord(self.needs.hunger)} (${Math.round(self.needs.hunger)}/100) — eat food you carry, or take it from Hall Town; if both are empty, food is grown at Greenfield (the farm), so go take_from there.`,
-    `- Thirst: ${needWord(self.needs.thirst)} (${Math.round(self.needs.thirst)}/100) — drink water you carry, or take it from Hall Town or the spring (the spring never runs dry).`,
-    `- Fatigue: ${needWord(self.needs.fatigue)} (${Math.round(self.needs.fatigue)}/100) — rest at a house.`,
-    `- Boredom: ${needWord(self.needs.boredom)} (${Math.round(self.needs.boredom)}/100) — enjoy goods at the Tavern, or simply spend time among company.`,
+    `Your needs (0–100): hunger ${needWord(self.needs.hunger)} (${Math.round(self.needs.hunger)}), thirst ${needWord(self.needs.thirst)} (${Math.round(self.needs.thirst)}), fatigue ${needWord(self.needs.fatigue)} (${Math.round(self.needs.fatigue)}), boredom ${needWord(self.needs.boredom)} (${Math.round(self.needs.boredom)}).`,
     self.backpack.length > 0
-      ? `- Backpack (${self.backpack.length}/${BACKPACK_CAPACITY} units of resources): ${summariseBackpack(self.backpack)}. You eat/drink from this first; use give_to to deliver it.`
-      : `- Backpack: empty (carries up to ${BACKPACK_CAPACITY} units of water/food; take_from the spring, Greenfield, or Hall Town to fill it).`,
+      ? `Backpack (${self.backpack.length}/${BACKPACK_CAPACITY}): ${summariseBackpack(self.backpack)}. You eat/drink from this first; give_to to deliver it.`
+      : `Backpack: empty (holds ${BACKPACK_CAPACITY}; take_from a source to fill it).`,
   ];
 
   const urgent = pressingNeed(self.needs);
-  if (urgent) {
-    lines.push('', `You feel ${urgent} — pressing enough to tend to now, before it tips into real distress: walk to the right place and relieve it, then get back to your day.`);
-  } else {
-    lines.push('', 'Your needs are under control — focus on your plan, your work, and the neighbours around you.');
-  }
+  if (urgent) lines.push('', `You feel ${urgent}.`);
   return lines;
 }
 
@@ -327,13 +309,37 @@ function feedbackBlock(reason: string | null): string[] {
   return ['', `[Last turn could not be carried out: ${reason}. Choose a different, useful action this turn.]`];
 }
 
+/**
+ * The VILLAGE-VISION block: the settlement's shared, long-horizon ambition — to grow
+ * from a cluster of huts into a true city — together with where it stands now (the
+ * god's named stage) and the milestones reached so far. This is what keeps the
+ * COLLECTIVE end-goal in front of every mind day after day, so the small daily chores
+ * add up to something: when the village is at ease, the mind is nudged to build,
+ * found a custom, or start a trade that grows the place. The standing ambition line is
+ * always shown; the live stage and milestones appear once the god has judged them.
+ */
+function villageVisionBlock(vision: VillageVision | null): string[] {
+  const lines = [
+    '',
+    'The village\'s shared dream is to grow from a cluster of huts into a city.',
+  ];
+  if (vision) {
+    if (vision.stage) lines.push(`What it has become so far: ${vision.stage}.`);
+    const recent = vision.milestones.slice(-5);
+    if (recent.length > 0) {
+      lines.push('Milestones on the road here (most recent last):');
+      for (const m of recent) lines.push(`- ${m.text}`);
+    }
+  }
+  return lines;
+}
+
 /** The PLAN block: what you meant to be doing about now, per this morning's agenda. */
 function planBlock(plan: PlanBlock | null, theme: string | null): string[] {
   if (!plan && !theme) return [];
-  const lines = ['', 'Your plan for today:'];
+  const lines = ['', 'What you had in mind for today (your own plan — follow it or not):'];
   if (theme) lines.push(`- Overall: ${theme}`);
-  if (plan) lines.push(`- Right now (${plan.when}): ${plan.intent}`);
-  lines.push('Let this guide you, but adapt freely to what is actually happening around you.');
+  if (plan) lines.push(`- Around now (${plan.when}): ${plan.intent}`);
   return lines;
 }
 
@@ -347,29 +353,76 @@ function planBlock(plan: PlanBlock | null, theme: string | null): string[] {
 function groupPlanBlock(myPlan: GroupPlan | null, joinable: GroupPlan | null): string[] {
   if (myPlan) {
     const roster = myPlan.members.map((m) => `${m.villagerName} (${m.role})`).join(', ');
-    const lines = [
+    return [
       '',
-      `Your group has a shared plan: "${myPlan.goal}". The roles, yours among them: ${roster}.`,
+      `Your group has a shared plan: "${myPlan.goal}" (${myPlan.kind}). The roles, yours among them: ${roster}.`,
     ];
-    if (myPlan.kind === 'prayer') {
-      lines.push(
-        'This is a prayer gathering — make your way to the Temple and pray_at it with the' +
-          ' others; prayer is strongest offered together.',
-      );
-    } else {
-      lines.push('Go and carry out YOUR part now — actions, not more talk. Trust the others to theirs.');
-    }
-    return lines;
   }
   if (joinable) {
     const roster = joinable.members.map((m) => `${m.villagerName} (${m.role})`).join(', ');
     return [
       '',
       `Your group is forming a plan: "${joinable.goal}" (proposed by ${joinable.proposerName}; so far: ${roster}).` +
-        ' You can join_plan with a role and help carry it out, or propose_plan of your own if you have a better idea.',
+        ' You could join_plan with a role, or not.',
     ];
   }
   return [];
+}
+
+/**
+ * How close (in ticks) a scheduled event must be for the mind to be told it is
+ * happening "now or very soon" and steered to its place. ~60 ticks is roughly three
+ * in-world hours — near enough to set out for, far enough not to drop everything early.
+ */
+const AGENDA_SOON_TICKS = 60;
+
+/** A loose, in-character "when" for an event, e.g. "tomorrow morning" / "today evening". */
+function whenLabel(event: AgendaEvent, nowTick: number): string {
+  const dd = event.day - simTimeFromTick(nowTick).day;
+  const day = dd <= 0 ? 'today' : dd === 1 ? 'tomorrow' : `in ${dd} days`;
+  return `${day} ${event.partOfDay}`;
+}
+
+/**
+ * The AGENDA block: this villager's own book of intentions — the events it is
+ * committed to (soonest first, with a strong nudge to head to one whose time is at
+ * hand), the events it has been invited to but not yet accepted, and its untimed
+ * notes. This is what turns a passing idea into something the mind actually keeps and
+ * acts on across the day, rather than forgetting it the moment the turn ends.
+ */
+function agendaBlock(
+  events: AgendaEvent[],
+  invited: AgendaEvent[],
+  notes: AgendaNote[],
+  nowTick: number,
+): string[] {
+  if (events.length === 0 && invited.length === 0 && notes.length === 0) return [];
+  const lines = ['', 'Your agenda — what you mean to do and where you are expected:'];
+
+  for (const e of events) {
+    const place = e.placeName ? ` at the ${e.placeName}` : '';
+    const company =
+      e.shared && e.participants.length > 1
+        ? ` (attending: ${e.participants.map((m) => m.villagerName).join(', ')})`
+        : '';
+    const soon = e.scheduledTick - nowTick;
+    let line = `- ${whenLabel(e, nowTick)}${place}: ${e.title}${company}`;
+    if (soon <= AGENDA_SOON_TICKS) {
+      line += e.placeId ? ` — its time is now (at the ${e.placeName ?? 'place'}, id: ${e.placeId}).` : ' — its time is now.';
+    }
+    lines.push(line);
+  }
+
+  for (const e of invited) {
+    const place = e.placeName ? ` at the ${e.placeName}` : '';
+    lines.push(
+      `- (invited) ${whenLabel(e, nowTick)}${place}: ${e.title} — ${e.organizerName} asks you to come` +
+        ` (accept_event id "${e.id}" to join).`,
+    );
+  }
+
+  for (const n of notes) lines.push(`- note to self: ${n.title}`);
+  return lines;
 }
 
 /** The CONVERSATION block: the running group chat, so a shared dialogue can form. */
@@ -389,8 +442,9 @@ function chebyshev(a: Vec2, b: Vec2): number {
 }
 
 /** The PERCEPTION block: the villagers, places, and objects sensed this turn. */
-function perceptionBlock(perception: Perception, hub: SocialHub | null, groupWarm = false): string[] {
-  const { self, nearbyVillagers, nearbyObjects, nearbyBuildings, nearbyCarts } = perception;
+function perceptionBlock(perception: Perception, hub: SocialHub | null): string[] {
+  const { self, nearbyVillagers, nearbyObjects, nearbyBuildings, nearbyCarts, atDepot } =
+    perception;
   const lines: string[] = [];
 
   // Gathering: tell the mind it is part of a group, so it talks to the company AND
@@ -399,67 +453,29 @@ function perceptionBlock(perception: Perception, hub: SocialHub | null, groupWar
   if (self.gathering) {
     const where = self.gathering.place ? ` at the ${self.gathering.place}` : '';
     const who = self.gathering.withNames.join(', ');
-    const groupSize = self.gathering.withIds.length + 1;
     lines.push(
       '',
-      `You are gathered in a group${where} with: ${who}. This is a chance to talk with` +
-        ' them — greet the group, join the conversation, or pursue your goal together.' +
-        ' Use say to speak to them all at once.',
+      `You are gathered${where} with: ${who} (say is heard by them all at once).`,
     );
-    if (groupWarm) {
-      // The group has been together a while — the talk is warm. Push past small talk
-      // toward doing something together, so a gathering becomes more than idle chatter.
-      lines.push(
-        'You have been together a while now and the conversation is warm — make it count.' +
-          ' Suggest something concrete: an errand to share, a story to tell, or a visit' +
-          ' somewhere together. Move the group from talk to doing.',
-      );
-    }
-    if (groupSize >= 3) {
-      // A real crowd: nudge toward DIVIDING the work by trade, not all doing one chore.
-      lines.push(
-        'You are several together now — but many hands work best spread across the chains,' +
-          ' not all on one chore. A quick word to divide it up — "I will gather wood, you' +
-          ' farm, you keep the cistern full" — then everyone goes to their OWN task. Put it' +
-          ' to the group with say if you like, then go do your part.',
-      );
-    } else {
-      // Just the two of you: a quieter prompt to talk or pair up on a task.
-      lines.push(
-        `It is just you and ${who} here. Strike up a real conversation — or suggest you` +
-          ' walk together to somewhere that needs doing and share the load.',
-      );
-    }
   }
 
   const withinEarshot = nearbyVillagers.filter((a) => a.canHear);
   const seenOnly = nearbyVillagers.filter((a) => a.canSee && !a.canHear);
 
   if (withinEarshot.length > 0) {
-    lines.push('', 'Villagers within earshot (use say and they will all hear you):');
+    lines.push('', 'Villagers within earshot (they hear what you say):');
     for (const a of withinEarshot) {
       lines.push(
         `- ${a.name} at (${a.position.x}, ${a.position.y}), ${a.distance} tile(s) away` +
           `${a.moving ? ', moving' : ', idle'}`,
       );
     }
-    // Neighbours are in earshot RIGHT NOW. A word or two is good — but talk is not the
-    // job. Trade a brief exchange, then get back to YOUR trade; the village runs on the
-    // work, not the chatter. Don't re-greet or re-agree on a plan you have already made.
-    lines.push(
-      'These neighbours are within earshot now — a good moment for a word or two. If' +
-        ' someone just spoke to you, reply to what they actually said. But keep it brief:' +
-        ' talk is not your work. Once you have exchanged a few words — or if you have' +
-        ' already agreed on a plan — stop talking and GO DO YOUR TRADE (take_from /' +
-        ' work_at / give_to / pray_at). Doing the thing is worth far more than saying it' +
-        ' again. Save the long talk for the Inn of an evening.',
-    );
   }
 
   if (seenOnly.length > 0) {
     // Visible but too far for your voice to carry (dusk/fog shrink sight, a storm
-    // shrinks hearing). You can see them; walk closer before trying to speak.
-    lines.push('', 'In sight but too far to hear you (walk closer to talk):');
+    // shrinks hearing) — purely factual; what to do about it is the villager's call.
+    lines.push('', 'In sight but too far to hear you:');
     for (const a of seenOnly) {
       lines.push(
         `- ${a.name} at (${a.position.x}, ${a.position.y}), ${a.distance} tile(s) away` +
@@ -469,26 +485,10 @@ function perceptionBlock(perception: Perception, hub: SocialHub | null, groupWar
   }
 
   if (nearbyVillagers.length === 0) {
-    lines.push('', 'No other villagers are within sensing range — there is no one to speak to right now.');
-    // When alone, keep villagers drawn to the shared hub so they converge and meet,
-    // rather than each drifting to its own corner. Far away → head there; already
-    // near → LINGER so you are on hand when someone arrives, instead of wandering off.
-    if (hub) {
-      const toHub = chebyshev(self.position, hub.position);
-      if (toHub > 4) {
-        lines.push(
-          `Head toward ${hub.name} at (${hub.position.x}, ${hub.position.y}) — that is where the` +
-            ' village gathers. Walk there now (unless a need is critical): it is the likeliest' +
-            ' place to find a neighbour to meet and work alongside.',
-        );
-      } else {
-        lines.push(
-          `You are by ${hub.name}, where the village gathers — this is where neighbours meet.` +
-            ' Stay here and potter about nearby (draw water, tidy a chore) so you are on hand' +
-            ' the moment someone arrives, rather than wandering off alone.',
-        );
-      }
-    }
+    // Purely factual: no one is near. Whether to seek company, work, or wander is the
+    // villager's own call — we name the hub only as a fact about where folk gather.
+    lines.push('', 'No one is within sensing range.');
+    if (hub) lines.push(`(${hub.name}, at (${hub.position.x}, ${hub.position.y}), is where the village tends to gather.)`);
   }
 
   if (nearbyBuildings.length > 0) {
@@ -497,19 +497,25 @@ function perceptionBlock(perception: Perception, hub: SocialHub | null, groupWar
       const purpose = b.function ? ` — ${b.function}` : '';
       const stock = describeStock(b);
       const supply = stock ? ` [${stock}]` : '';
-      // Flag a place you have already reached: re-issuing move_to its centre is a
-      // wasted step — you can act on it right now. This is what breaks the "walk
-      // to the building I'm already standing at, every turn" loop.
+      // Flag a place already reached, factually: you stand at it (no move needed to
+      // act on it). State, not instruction — what you do there is your choice.
       const here = b.distance <= AT_BUILDING_REACH;
       const located = here
-        ? 'right next to you — you are HERE, so work_at/take_from/give_to it now WITHOUT moving'
+        ? 'right beside you — you are standing at it (no need to move to act on it)'
         : `${b.distance} tile(s) away, position (${b.position.x}, ${b.position.y})`;
       lines.push(`- ${b.name} (a ${b.kind}, id: ${b.id})${purpose}, ${located}${supply}`);
     }
   }
 
   if (nearbyCarts.length > 0) {
-    lines.push('', 'Carts you can see (set their run with command_cart when standing beside one):');
+    // At the depot a villager dispatches the WHOLE fleet from one spot; otherwise it
+    // can only command a cart it is standing beside.
+    lines.push(
+      '',
+      atDepot
+        ? 'Carts you can dispatch from the depot (set any one with command_cart — no need to walk to it):'
+        : 'Carts you can see:',
+    );
     for (const c of nearbyCarts) {
       const load =
         c.cargoCount > 0
@@ -520,13 +526,15 @@ function perceptionBlock(perception: Perception, hub: SocialHub | null, groupWar
         : 'no order yet';
       const state =
         c.phase === 'waiting' && c.waitReason
-          ? ` — WAITING: ${c.waitReason}`
+          ? ` — waiting: ${c.waitReason}`
           : c.phase === 'idle' && !c.order
-            ? ' — standing idle, give it a run'
+            ? ' — idle, no order'
             : '';
-      const located = c.canCommand
-        ? 'right next to you — you are HERE, so command_cart it now WITHOUT moving'
-        : `${c.distance} tile(s) away, position (${c.position.x}, ${c.position.y})`;
+      const located = atDepot
+        ? `at (${c.position.x}, ${c.position.y}) — dispatchable from here`
+        : c.canCommand
+          ? 'right beside you (no need to move to command it)'
+          : `${c.distance} tile(s) away, position (${c.position.x}, ${c.position.y})`;
       lines.push(`- ${c.name} (a ${c.tier} cart, id: ${c.id}), ${located} [${load}; ${order}${state}]`);
     }
   }
@@ -552,8 +560,7 @@ function knownPlacesBlock(map: MapEntry[], self: Perception['self']): string[] {
   if (map.length === 0) return [];
   const lines = [
     '',
-    'Places in the village (you know where these are even when you cannot see them —' +
-      ' move_to a place\'s coordinates to head there, over several steps if it is far):',
+    'Places in the village (you know where these are even when you cannot see them):',
   ];
   for (const e of map) {
     const dist = chebyshev(self.position, e.position);
@@ -626,83 +633,21 @@ function buildingActivityBlock(
   return lines;
 }
 
-/** The resource a backpack is mostly carrying (its haul), or null if empty/mixed-empty. */
-function dominantResource(backpack: string[]): ResourceKind | null {
-  const counts = new Map<ResourceKind, number>();
-  for (const r of backpack) if (isResourceKind(r)) counts.set(r, (counts.get(r) ?? 0) + 1);
-  let best: ResourceKind | null = null;
-  let bestN = 0;
-  for (const [r, n] of counts) if (n > bestN) ((best = r), (bestN = n));
-  return best;
-}
-
-/**
- * Where a carried resource should be DELIVERED. The economy is a chain (water →
- * Greenfield → Hall Town), so prefer a converter that consumes this resource as its
- * input (water → Greenfield, the bottleneck); otherwise the store most short of it.
- * Never the spring (you draw from it, never give to it). Null when nowhere has room.
- */
-function deliveryTargetFor(resource: ResourceKind, map: MapEntry[]): MapEntry | null {
-  const candidates = map.filter((e) => {
-    const kind = e.kind as BuildingKind;
-    if (isSource(kind)) return false; // a source (spring, grove) is drawn from, never delivered to
-    if (!buildingStockKinds(kind).includes(resource)) return false;
-    return (e.stock[resource] ?? 0) < e.capacity; // has room to receive
-  });
-  if (candidates.length === 0) return null;
-  const converter = candidates.find((e) => buildingConversion(e.kind as BuildingKind)?.input === resource);
-  if (converter) return converter;
-  // Otherwise the emptiest store — the one most in need of this resource.
-  return candidates
-    .slice()
-    .sort((a, b) => (a.stock[resource] ?? 0) / a.capacity - (b.stock[resource] ?? 0) / b.capacity)[0];
-}
-
-/**
- * The COMMITMENT block: a hard nudge to stop talking and act. Emitted only when the
- * mind has stalled in conversation (AgentService's commitment guard) — it overrides
- * the perception block's usual "prefer to keep talking" lean for this one turn, and
- * pairs with `say` being withheld from the tools. When the villager carries a
- * deliverable haul we name the actual destination AND its coordinates, so the forced
- * move is a real step toward Greenfield/Hall Town rather than an aimless shuffle.
- */
-function commitmentBlock(perception: Perception, map: MapEntry[]): string[] {
-  const backpack = perception.self.backpack;
-  const resource = dominantResource(backpack);
-  const target = resource && backpack.length >= BACKPACK_CAPACITY - 1 ? deliveryTargetFor(resource, map) : null;
-
-  const open = 'You have spent several turns agreeing on a plan without acting on it. Stop talking and DO it now:';
-  if (target) {
-    const stock = describeStock(target);
-    return [
-      '',
-      `${open} you are carrying ${summariseBackpack(backpack)} — take it to ${target.name} at` +
-        ` (${target.position.x}, ${target.position.y})${stock ? `, which holds [${stock}]` : ''}.` +
-        ` move_to those coordinates now, then give_to ${target.id} when you arrive. Do not speak this turn — move.`,
-    ];
-  }
-  return [
-    '',
-    `${open} go take the next concrete step yourself — head to one of the places listed above` +
-      ' (move_to its coordinates) and take_from / work_at / give_to it. Take a real step this turn — do not speak.',
-  ];
-}
-
 /** Inputs to a per-turn user message, beyond the perception itself. */
 export interface TurnContext {
   recentSpeech?: HeardUtterance[];
+  /** The village's shared vision (ambition + named stage + milestones), if known. */
+  villageVision?: VillageVision | null;
   /** The plan block governing this part of day, if any. */
   planBlock?: PlanBlock | null;
   /** The day's overall theme, if a plan exists. */
   planTheme?: string | null;
-  /** The village's shared gathering place, used to steer a lone villager toward company. */
+  /** The village's shared gathering place, named (as a fact) when the villager is alone. */
   socialHub?: SocialHub | null;
-  /** Append the commitment directive (stop talking, act on the haul) for this turn. */
-  commitToAction?: boolean;
   /**
    * The whole-village layout (every building with its centre tile + stock), so the
    * mind always knows where places are without first calling consult_map. Used for
-   * the known-places block and to address the commitment nudge at a real destination.
+   * the known-places block.
    */
   villageMap?: MapEntry[];
   /**
@@ -717,16 +662,35 @@ export interface TurnContext {
    * mind corrects course this turn rather than repeating the same fumble blind.
    */
   lastSkippedReason?: string | null;
-  /**
-   * True once the villager has kept the same company across several turns — the
-   * conversation has warmed up, so the prompt nudges toward suggesting something
-   * (an errand together, a story, a visit) rather than trading more greetings.
-   */
-  groupWarm?: boolean;
   /** The shared plan this villager is already a member of, if any (its part to do). */
   groupPlan?: GroupPlan | null;
   /** A plan its current company is forming that it could join, if any. */
   joinablePlan?: GroupPlan | null;
+  /** Scheduled events this villager is attending (personal or shared), soonest first. */
+  agendaEvents?: AgendaEvent[];
+  /** Events this villager has been invited to but not yet accepted, soonest first. */
+  agendaInvited?: AgendaEvent[];
+  /** This villager's untimed agenda notes, newest first. */
+  agendaNotes?: AgendaNote[];
+  /**
+   * Salient things that happened AROUND this villager since it last acted —
+   * accumulated across the many world ticks between thoughts (a neighbour it
+   * passed, someone coming within earshot, arriving somewhere, a need turning
+   * urgent). Lets a mind react to what it would otherwise have missed by only
+   * seeing a single snapshot at think-time. Newest last.
+   */
+  recentEvents?: string[];
+}
+
+/**
+ * What changed around the villager between its last thought and this one, as a
+ * short bulleted recap. Empty when nothing notable happened (the block is omitted).
+ */
+function recentEventsBlock(events: string[]): string[] {
+  if (events.length === 0) return [];
+  const lines = ['', 'Since you last acted, around you:'];
+  for (const e of events.slice(-8)) lines.push(`- ${e}`);
+  return lines;
 }
 
 /** Compose the full per-turn USER message from its blocks. */
@@ -734,10 +698,25 @@ export function buildPerceptionMessage(perception: Perception, ctx: TurnContext 
   const { self } = perception;
   const lines = [
     ...bodyBlock(perception),
+    // The shared long-horizon ambition (grow into a city) + how far the village has
+    // come, just under the body so the collective goal frames the day's plan below it.
+    ...villageVisionBlock(ctx.villageVision ?? null),
     ...planBlock(ctx.planBlock ?? null, ctx.planTheme ?? null),
     // The shared agenda, right under the personal plan: what the group is doing
     // together takes precedence over drifting off alone.
     ...groupPlanBlock(ctx.groupPlan ?? null, ctx.joinablePlan ?? null),
+    // This villager's own agenda — kept commitments, invitations, and notes — so a
+    // scheduled event actually pulls it there when the hour comes.
+    ...agendaBlock(
+      ctx.agendaEvents ?? [],
+      ctx.agendaInvited ?? [],
+      ctx.agendaNotes ?? [],
+      perception.tick,
+    ),
+    // What happened around us since the last thought (encounters, arrivals, needs
+    // turning urgent) — placed just above the live conversation so the mind reacts
+    // to events it would otherwise have missed between snapshots.
+    ...recentEventsBlock(ctx.recentEvents ?? []),
     // The running exchange comes before the raw perception: it is the most
     // action-relevant thing this turn, and is what lets a dialogue form.
     ...conversationBlock(ctx.recentSpeech ?? []),
@@ -746,22 +725,24 @@ export function buildPerceptionMessage(perception: Perception, ctx: TurnContext 
     ...knownPlacesBlock(ctx.villageMap ?? [], self),
     // Recent history of the places in reach, so the mind coordinates over it.
     ...buildingActivityBlock(perception.nearbyBuildings, ctx.buildingActivity ?? {}, perception.tick),
-    ...perceptionBlock(perception, ctx.socialHub ?? null, ctx.groupWarm ?? false),
-    // A note on last turn's fumble (if any), just before the call-to-action so it is
-    // fresh in mind when the model chooses.
+    ...perceptionBlock(perception, ctx.socialHub ?? null),
+    // A neutral note on why last turn's action did not land (if any), so the mind has
+    // the fact and can decide afresh — not an instruction on what to do instead.
     ...feedbackBlock(ctx.lastSkippedReason ?? null),
   ];
+  // A bare, neutral close that explains the agentic LOOP without steering the
+  // choice: look things up if you need to, then act — possibly more than once —
+  // and stop when you are done. No priorities, no "you should"; the choice is the
+  // villager's, which is the whole point of an emergent sim.
   lines.push(
     '',
-    'Decide your single next action and call one tool. If you are already standing at the place' +
-      ' you want (a building marked HERE), act on it — work_at / take_from / give_to / say —' +
-      ' rather than walking to it again. To go somewhere new, move_to a tile that is NOT your' +
-      ` current position (${self.position.x}, ${self.position.y}).`,
+    'It is your move. You may first LOOK THINGS UP with the read-only tools ' +
+      '(consult_map, recall_memories, building_guide, construction_status, cart_status, look_at) — ' +
+      'their answers come back to you and cost no time in the world. Then ACT by calling ' +
+      'an action tool; you may take more than one action in a row if it makes sense (e.g. ' +
+      'take a resource, then work). When you have nothing more to do this moment, simply ' +
+      'stop calling tools.',
   );
-  // The commitment directive comes LAST so it is the most recent instruction the
-  // model reads — overriding the perception block's usual "prefer to keep talking"
-  // lean on the turn we need the villager to act on its haul instead.
-  if (ctx.commitToAction) lines.push(...commitmentBlock(perception, ctx.villageMap ?? []));
   return lines.join('\n');
 }
 

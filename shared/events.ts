@@ -27,7 +27,9 @@
  * ---------------------------------------------------------------------------
  */
 
-import type { Villager, AgentDecision, BuildableId, Cart, ResourceKind, Tree, Building, BuildingStock, BuildingEvent, WeatherKind, Conversation, Gathering, Relationship, GroupPlan, EntityType, LlmCallPurpose } from './types';
+import type { Villager, AgentDecision, AgentTraceStep, AgendaItem, AgendaPartOfDay, BuildableId, Cart, ResourceKind, Tree, Building, BuildingStock, BuildingEvent, WeatherKind, Conversation, Gathering, Relationship, GroupPlan, EntityType, LlmCallPurpose, SupervisorDailyReportPayload, EffortPurpose, ReasoningEffort, ReasoningEffortSettings, LlmModelConfig, LlmPoolConfig, LlmUsage, VillageVision, TerrainPalette, VillageSize } from './types';
+
+export type { DivineAct, SupervisorDailyReportPayload, VillageVision } from './types';
 
 /** The Topic Exchanges that make up the bus, one per direction of the nervous system. */
 export const EXCHANGES = {
@@ -85,6 +87,11 @@ export interface WorldInitPayload {
   buildings: Building[];
   /** Current weather, so the picture is complete for a fresh observer. */
   weather: WeatherKind;
+  /** Flavour of an LLM-generated village (theme label + a sentence). Absent for the classic seed. */
+  theme?: string;
+  setting?: string;
+  /** Themed ground colours (see {@link TerrainPalette}); absent in old saves. */
+  palette?: TerrainPalette;
 }
 
 /** Per-tick result of processing movement: the moving villagers' new positions. */
@@ -116,18 +123,62 @@ export interface WorldWeatherChangedPayload {
  */
 export type WorldBuildingEventPayload = BuildingEvent;
 
+/**
+ * Progress of an LLM world GENERATION, streamed while the backend builds a fresh
+ * village (which takes minutes) so the browser can show a live loading overlay.
+ * Emitted ONLY when `GENERATE_LLM=on` and a generation is actually running — a
+ * normal boot never sends these, so the overlay only ever appears during true
+ * generation. The final event carries `done: true`, immediately before the engine
+ * publishes `world.init`. `step`/`total` are set for the per-villager phase so the
+ * UI can show "3 of 6".
+ */
+export interface WorldGeneratingPayload {
+  /** Which stage of generation we're in. */
+  phase: 'map' | 'villagers' | 'bible' | 'assembling';
+  /** Human, present-tense line for the overlay (e.g. "Bringing the villagers to life"). */
+  label: string;
+  /** 1-based index within a counted phase (the villagers), when applicable. */
+  step?: number;
+  /** Total items in a counted phase (the villager count), when applicable. */
+  total?: number;
+  /** True on the final event, just before `world.init`; tells the UI to dismiss. */
+  done?: boolean;
+}
+
+/** The backend has no world and is waiting for the player's setup choice. */
+export interface WorldNeedsSetupPayload {
+  canAuto: boolean;
+  defaultStyle: string;
+  maxVillagers: number;
+  defaultVillagers: number;
+  defaultSize: VillageSize;
+}
+
+/** A fast style-colour preview for the setup screen (answer to `user.config.preview_style`). */
+export interface WorldStylePreviewPayload {
+  requestId: number;
+  theme: string;
+  palette: TerrainPalette;
+}
+
 export type WorldInitEvent = EventEnvelope<'world.init', WorldInitPayload>;
 export type WorldMapUpdatedEvent = EventEnvelope<'world.map_updated', WorldMapUpdatedPayload>;
 export type WorldWeatherChangedEvent =
   EventEnvelope<'world.weather_changed', WorldWeatherChangedPayload>;
 export type WorldBuildingEvent = EventEnvelope<'world.building_event', WorldBuildingEventPayload>;
+export type WorldGeneratingEvent = EventEnvelope<'world.generating', WorldGeneratingPayload>;
+export type WorldNeedsSetupEvent = EventEnvelope<'world.needs_setup', WorldNeedsSetupPayload>;
+export type WorldStylePreviewEvent = EventEnvelope<'world.style_preview', WorldStylePreviewPayload>;
 
 /** Everything published to `world.events`. Narrow on `.type`. */
 export type WorldEvent =
   | WorldInitEvent
   | WorldMapUpdatedEvent
   | WorldWeatherChangedEvent
-  | WorldBuildingEvent;
+  | WorldBuildingEvent
+  | WorldGeneratingEvent
+  | WorldNeedsSetupEvent
+  | WorldStylePreviewEvent;
 
 // ---------------------------------------------------------------------------
 // user.commands  (gateway -> engine)
@@ -220,6 +271,57 @@ export type UserSpawnEvent = EventEnvelope<'user.spawn_entity', UserSpawnPayload
 export type UserBlessEvent = EventEnvelope<'user.bless', UserBlessPayload>;
 export type UserSmiteEvent = EventEnvelope<'user.smite', UserSmitePayload>;
 
+/** Set the reasoning effort for one LLM call purpose (a backend-config change). */
+export interface UserSetReasoningEffortPayload {
+  purpose: EffortPurpose;
+  level: ReasoningEffort;
+}
+/**
+ * A Settings-window change to the model's reasoning effort. A MULTI-word key the
+ * engine's one-word `user.*` binding skips — handled only by the backend
+ * (`user.config.*`), which owns the LLM client and persists the setting.
+ */
+export type UserSetReasoningEffortEvent =
+  EventEnvelope<'user.config.set_reasoning_effort', UserSetReasoningEffortPayload>;
+
+/** Switch the engine's global chat model (a backend-config change). */
+export interface UserSetLlmModelPayload {
+  model: string;
+}
+/**
+ * A Settings-window model switch. Like {@link UserSetReasoningEffortEvent} a
+ * MULTI-word `user.config.*` key the engine's one-word `user.*` binding skips —
+ * handled only by the backend, which owns the LLM client and persists the choice.
+ */
+export type UserSetLlmModelEvent =
+  EventEnvelope<'user.config.set_llm_model', UserSetLlmModelPayload>;
+
+/** Re-discover the backend's available models and re-broadcast the config. */
+export type UserRefreshLlmModelsEvent =
+  EventEnvelope<'user.config.refresh_llm_models', Record<string, never>>;
+
+/** Create the village from the setup screen — `user.config.*` so the engine skips it. */
+export interface UserGenerateWorldPayload {
+  mode: 'auto' | 'static';
+  style?: string;
+  villagers?: number;
+  size?: VillageSize;
+}
+export type UserGenerateWorldEvent =
+  EventEnvelope<'user.config.generate_world', UserGenerateWorldPayload>;
+
+/** A fast style-colour preview request from the setup screen. */
+export interface UserPreviewStylePayload {
+  requestId: number;
+  style: string;
+}
+export type UserPreviewStyleEvent =
+  EventEnvelope<'user.config.preview_style', UserPreviewStylePayload>;
+
+/** Wipe the world and return to setup ("New Village"). */
+export type UserResetWorldEvent =
+  EventEnvelope<'user.config.reset_world', Record<string, never>>;
+
 /** Everything published to `user.commands`. Narrow on `.type`. */
 export type UserCommandEvent =
   | UserForceMoveEvent
@@ -230,7 +332,13 @@ export type UserCommandEvent =
   | UserSetWeatherEvent
   | UserSpawnEvent
   | UserBlessEvent
-  | UserSmiteEvent;
+  | UserSmiteEvent
+  | UserSetReasoningEffortEvent
+  | UserSetLlmModelEvent
+  | UserRefreshLlmModelsEvent
+  | UserGenerateWorldEvent
+  | UserPreviewStyleEvent
+  | UserResetWorldEvent;
 
 // ---------------------------------------------------------------------------
 // villager.intents  (villagers -> engine)
@@ -330,6 +438,11 @@ export interface VillagerProposeBuildPayload {
   structure: BuildableId;
   /** The name the finished building will carry, chosen by the proposer. */
   name: string;
+  /**
+   * For an INVENTED structure (`structure: 'custom'`): what it is, in the proposer's
+   * words — becomes the finished landmark's function. Ignored for catalog kinds.
+   */
+  description?: string;
   x: number;
   y: number;
 }
@@ -350,6 +463,48 @@ export interface VillagerCommandCartPayload {
   /** Building id to unload the resource TO. */
   toBuildingId: string;
 }
+
+/**
+ * A villager adds an item to its OWN agenda: an untimed `note`, or a personal `event`
+ * fixed to `dayOffset` (days from today) + `partOfDay` and optionally a `placeId`. Only
+ * the {@link AgendaCoordinator} consumes this; the engine ignores it like the plan intents.
+ */
+export interface VillagerAddAgendaPayload {
+  villagerId: string;
+  itemKind: 'note' | 'event';
+  title: string;
+  /** Events only: days from today (0 = today). */
+  dayOffset?: number;
+  /** Events only: the part of day it happens in. */
+  partOfDay?: AgendaPartOfDay;
+  /** Events only: the building id it happens at, if any. */
+  placeId?: string;
+}
+
+/**
+ * A villager PROPOSES a shared event to the gathering it is in: a happening at
+ * `dayOffset` + `partOfDay` (optionally at `placeId`). The coordinator opens the event
+ * with the proposer attending and everyone gathered with them invited.
+ */
+export interface VillagerProposeEventPayload {
+  villagerId: string;
+  title: string;
+  dayOffset: number;
+  partOfDay: AgendaPartOfDay;
+  placeId?: string;
+}
+
+/** A villager ACCEPTS an event it was invited to (by id), committing to attend. */
+export interface VillagerAcceptEventPayload {
+  villagerId: string;
+  eventId: string;
+}
+
+export type VillagerAddAgendaEvent = EventEnvelope<'villager.add_agenda', VillagerAddAgendaPayload>;
+export type VillagerProposeEventEvent =
+  EventEnvelope<'villager.propose_event', VillagerProposeEventPayload>;
+export type VillagerAcceptEventEvent =
+  EventEnvelope<'villager.accept_event', VillagerAcceptEventPayload>;
 
 export type VillagerProposePlanEvent =
   EventEnvelope<'villager.propose_plan', VillagerProposePlanPayload>;
@@ -391,13 +546,33 @@ export interface VillageDailySummaryPayload {
   notableQuotes?: string[];
   /** Prayers villagers offered at the temple this day — petitions to the god. */
   notablePrayers?: string[];
+  /**
+   * Structures the village FINISHED building this day, one human line each (e.g.
+   * "Hearthstone Hall — raised a house"). The objective signal of growth the god
+   * reads to judge how city-like the village has become and to record milestones.
+   */
+  completedBuilds?: string[];
 }
 
 export type VillageDailySummaryEvent =
   EventEnvelope<'village.daily_summary', VillageDailySummaryPayload>;
 
+export type SupervisorDailyReportEvent =
+  EventEnvelope<'village.daily_report', SupervisorDailyReportPayload>;
+
+/**
+ * The village's shared VISION, broadcast by the god whenever it reassesses the
+ * settlement's growth (each day, and once on boot from the restored state). Every
+ * villager folds the latest into its prompt so the collective goal — grow the
+ * village into a city — and the milestones reached so far are always in front of it.
+ */
+export type VillageVisionEvent = EventEnvelope<'village.vision', VillageVision>;
+
 /** Everything published to `village.events`. Narrow on `.type`. */
-export type VillageEvent = VillageDailySummaryEvent;
+export type VillageEvent =
+  | VillageDailySummaryEvent
+  | SupervisorDailyReportEvent
+  | VillageVisionEvent;
 
 // ---------------------------------------------------------------------------
 // supervisor.commands  (the "God Agent" -> engine & villagers)
@@ -443,10 +618,8 @@ export interface VillagerThoughtProcessPayload {
   villagerName: string;
   tick: number;
   /**
-   * The logical SIMULATION tick (turn-coordinator round) this think happened in,
-   * when the village is running under the {@link SimulationEvent} coordinator. A
-   * round is one pass in which every eligible villager gets an LLM window; see
-   * `TurnCoordinator`. Absent for an uncoordinated (legacy wall-clock) mind.
+   * The in-world tick this think was granted in, when the village runs under the
+   * `MindScheduler`. Absent for an uncoordinated (legacy self-paced) mind.
    */
   roundTick?: number;
   /** The memories RAG pulled for this turn (most-relevant first), with scores. */
@@ -457,6 +630,20 @@ export interface VillagerThoughtProcessPayload {
   rawOutput: string;
   /** The validated decision we ACTUALLY published, or null if the turn was skipped. */
   decision: AgentDecision | null;
+  /**
+   * Where {@link decision} came from: `'llm'` when the model chose it, `'fallback'`
+   * when the model produced nothing usable (a malformed call, a declined action, or
+   * an engine error) and we substituted a scripted contextual step. A `'fallback'`
+   * turn has an empty (or partial) {@link rawOutput} — it is NOT an authored LLM
+   * decision, so consumers can tell the two apart. Omitted on skipped turns.
+   */
+  decisionSource?: 'llm' | 'fallback';
+  /**
+   * The full agentic TRACE for this turn — every lookup tool, world action, and the
+   * final yield, in order — when the mind ran the multi-step loop. Absent for a
+   * single-decision turn. {@link decision} remains the representative committed action.
+   */
+  steps?: AgentTraceStep[];
 }
 
 export type VillagerThoughtProcessEvent =
@@ -490,12 +677,25 @@ export type VillagerRelationshipEvent =
 export type VillagerGroupPlanEvent =
   EventEnvelope<'villager.group_plan.updated', GroupPlan>;
 
+/**
+ * An agenda item was created or changed (a new note/event, a fresh acceptance). Rides
+ * the telemetry exchange so the minds keep their own agenda current AND the gateway can
+ * surface every villager's agenda to the UI. Carries the whole item each time.
+ */
+export type VillagerAgendaEvent = EventEnvelope<'villager.agenda.updated', AgendaItem>;
+
+/** An agenda item was dropped (an event whose time has passed, or a stale note). */
+export type VillagerAgendaRemovedEvent =
+  EventEnvelope<'villager.agenda.removed', { itemId: string }>;
+
 /** Everything published to `villager.telemetry`. Narrow on `.type`. */
 export type VillagerTelemetryEvent =
   | VillagerThoughtProcessEvent
   | VillagerConversationEvent
   | VillagerRelationshipEvent
-  | VillagerGroupPlanEvent;
+  | VillagerGroupPlanEvent
+  | VillagerAgendaEvent
+  | VillagerAgendaRemovedEvent;
 
 // ---------------------------------------------------------------------------
 // engine.telemetry  (the LLM-engine HTTP client -> observers)
@@ -546,26 +746,89 @@ export interface LlmCallFinishedPayload {
   /** Error message when `ok` is false (e.g. the 500 detail, or "aborted" on timeout). */
   error?: string;
   startedAt: number;
+  /** Token usage the model reported for this call, when available. */
+  usage?: LlmUsage;
+}
+
+/**
+ * A STREAMING delta of an in-flight `/decide` call — one slice of the model's
+ * output as the engine relays the token stream back. Emitted only for the
+ * `decide` endpoint (villager + God-Agent tool decisions stream end-to-end; the
+ * `complete`/`embed` paths stay buffered). Many of these flow between the call's
+ * `started` and `finished` events, each carrying the newest chunk of visible
+ * output and/or the model's separately-reported reasoning ("thinking").
+ */
+export interface LlmCallDeltaPayload {
+  /** The id of the `started`/`finished` pair this delta belongs to. */
+  id: number;
+  /** Newest slice of visible output text (may include `<think>` tags to split client-side). */
+  content?: string;
+  /** Newest slice of separately-reported reasoning, when the model breaks it out. */
+  reasoning?: string;
 }
 
 export type LlmCallStartedEvent = EventEnvelope<'engine.llm.started', LlmCallStartedPayload>;
+export type LlmCallDeltaEvent = EventEnvelope<'engine.llm.delta', LlmCallDeltaPayload>;
 export type LlmCallFinishedEvent = EventEnvelope<'engine.llm.finished', LlmCallFinishedPayload>;
 
+/** The engine's current per-purpose reasoning-effort config (broadcast on change + at boot). */
+export interface EngineReasoningEffortPayload {
+  settings: ReasoningEffortSettings;
+}
+export type EngineReasoningEffortEvent =
+  EventEnvelope<'engine.reasoning_effort', EngineReasoningEffortPayload>;
+
+/** The engine's current chat-model config (broadcast on change, refresh, + at boot). */
+export interface EngineLlmModelPayload {
+  config: LlmModelConfig;
+}
+export type EngineLlmModelEvent =
+  EventEnvelope<'engine.llm_model', EngineLlmModelPayload>;
+
+/** The engine's current POOL shape (endpoints + live busy flags), broadcast on a short interval. */
+export interface EngineLlmPoolPayload {
+  config: LlmPoolConfig;
+}
+export type EngineLlmPoolEvent =
+  EventEnvelope<'engine.llm_pool', EngineLlmPoolPayload>;
+
 /** Everything published to `engine.telemetry`. Narrow on `.type`. */
-export type EngineTelemetryEvent = LlmCallStartedEvent | LlmCallFinishedEvent;
+export type EngineTelemetryEvent =
+  | LlmCallStartedEvent
+  | LlmCallDeltaEvent
+  | LlmCallFinishedEvent
+  | EngineReasoningEffortEvent
+  | EngineLlmModelEvent
+  | EngineLlmPoolEvent;
 
 // ---------------------------------------------------------------------------
 // simulation.events  (the turn coordinator's logical-tick clock)
 // ---------------------------------------------------------------------------
 
 /**
- * The coordinator granting ONE villager its LLM window for the current round.
- * Only the addressed villager thinks; everyone else waits their turn, so the
- * single shared LLM is never hit by two minds at once.
+ * A villager's mind ASKING for an LLM window because something around it changed
+ * (it was spoken to, a neighbour came within earshot, a need crossed into
+ * distress, it arrived somewhere). This is the INTERRUPT half of the scheduler's
+ * "hybrid heartbeat + interrupt" trigger: the {@link MindScheduler} raises this
+ * villager's priority and grants it a turn as soon as an endpoint is free, instead
+ * of waiting for its idle heartbeat. `urgency` is 0..1 (higher = sooner).
+ */
+export interface MindWantsTurnPayload {
+  villagerId: string;
+  /** How pressing the stimulus is, 0..1. The scheduler grants highest-urgency first. */
+  urgency: number;
+  /** A short reason for telemetry/logs (e.g. "spoken to by Mira"). */
+  reason?: string;
+}
+
+/**
+ * The scheduler granting ONE villager its LLM window. Under the parallel pool,
+ * up to {@link LlmPoolConfig.capacity} of these are live at once (one per free
+ * endpoint); a single endpoint still serializes the minds routed to it.
  */
 export interface SimTurnGrantedPayload {
   villagerId: string;
-  /** The logical tick (round number) this grant belongs to. */
+  /** The in-world tick this grant belongs to (the wall-clock sim clock). */
   tick: number;
 }
 
@@ -598,16 +861,18 @@ export interface SimTickPayload {
 }
 
 /**
- * The round is OVER: every villager granted a turn this tick has decided. Minds
- * hold the action they chose during their turn and apply it now, on this signal, so
- * all of a round's decisions take effect together AT THE END OF THE TICK rather than
- * one-by-one mid-round (no villager acts on another's not-yet-applied move).
+ * LEGACY (no longer emitted): under the old lockstep coordinator this signalled
+ * the end of a round, when minds applied the action they'd buffered so a round's
+ * decisions landed together. With the parallel {@link MindWantsTurnPayload}-driven
+ * scheduler there are no rounds — each mind acts the moment it decides — so nothing
+ * publishes or consumes this. The type is kept only for wire/back-compat.
  */
 export interface SimTickEndPayload {
   /** The logical tick (round number) that just finished. */
   tick: number;
 }
 
+export type MindWantsTurnEvent = EventEnvelope<'mind.wants_turn', MindWantsTurnPayload>;
 export type SimTurnGrantedEvent = EventEnvelope<'sim.turn_granted', SimTurnGrantedPayload>;
 export type SimTurnDoneEvent = EventEnvelope<'sim.turn_done', SimTurnDonePayload>;
 export type SimTickEvent = EventEnvelope<'sim.tick', SimTickPayload>;
@@ -615,6 +880,7 @@ export type SimTickEndEvent = EventEnvelope<'sim.tick_end', SimTickEndPayload>;
 
 /** Everything published to `simulation.events`. Narrow on `.type`. */
 export type SimulationEvent =
+  | MindWantsTurnEvent
   | SimTurnGrantedEvent
   | SimTurnDoneEvent
   | SimTickEvent
@@ -641,4 +907,7 @@ export type VillagerIntentEvent =
   | VillagerProposePlanEvent
   | VillagerJoinPlanEvent
   | VillagerProposeBuildEvent
-  | VillagerCommandCartEvent;
+  | VillagerCommandCartEvent
+  | VillagerAddAgendaEvent
+  | VillagerProposeEventEvent
+  | VillagerAcceptEventEvent;

@@ -90,6 +90,36 @@ export function simTimeFromTick(tick: number): SimTime {
   return { date, day, hour, minute, partOfDay: partOfDay(hour) };
 }
 
+/**
+ * The representative wall-clock HOUR each coarse {@link PartOfDay} pins to — the
+ * hour an event scheduled loosely "in the morning / afternoon / evening / night"
+ * is fixed at. Villagers reason in parts of day, not exact clock times, so the
+ * agenda lets a mind say "tomorrow afternoon" and we anchor it here to a concrete
+ * hour the simulation can schedule and sort by.
+ */
+export const PART_OF_DAY_HOUR: Record<PartOfDay, number> = {
+  morning: 9,
+  afternoon: 15,
+  evening: 20,
+  night: 2,
+};
+
+/**
+ * The engine tick at which a given in-world DAY (1-based) and PART OF DAY falls —
+ * the inverse of {@link simTimeFromTick} taken at that part's representative hour
+ * ({@link PART_OF_DAY_HOUR}). This is what turns a villager's loose "tomorrow
+ * afternoon" into a concrete target tick the agenda can schedule, steer toward, and
+ * sort a timeline by. In-world days run dawn-to-dawn (the epoch is 06:00), so an
+ * hour before 06:00 belongs to the LATE tail of its day, not its start.
+ */
+export function tickForDayPart(day: number, part: PartOfDay): number {
+  const hour = PART_OF_DAY_HOUR[part];
+  // Hours elapsed since this in-world day's 06:00 start; pre-dawn hours wrap to its tail.
+  const offsetHours = hour >= 6 ? hour - 6 : hour + 18;
+  const msOffset = Math.max(0, day - 1) * MS_PER_DAY + offsetHours * 60 * 60 * 1000;
+  return Math.round(msOffset / (SIM_SECONDS_PER_TICK * 1000));
+}
+
 /** Zero-pad a 0..59 (or 0..23) clock component to two digits. */
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);

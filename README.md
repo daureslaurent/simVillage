@@ -39,8 +39,8 @@ their own. You just watch. Or, if you like, nudge.**
 🙏 Brother Elias the Devout — fervent, persuasive, gentle but relentless
   "Win every neighbour to the Temple of the Dawn."
 
-🪣 Wrenna the Water-Carrier — tireless, neighbourly, methodical
-  "Keep the water moving along the chain."
+📐 Edda the Architect       — visionary, orderly, tireless, proud of fine work
+  "Raise new structures and keep the village well-ordered."
 
 🌲 Pip the Wood-Gatherer    — young, eager, chatty, endlessly curious
   "Keep the craft chain fed and learn every trade."
@@ -170,13 +170,14 @@ and stores those as high-importance reflections. Villagers grow.
 
 ```ascii
   💧 Old Spring ──(haul water)──→ 🚜 Greenfield Farmstead ──(haul food)──→ 🏛️ Hall Town
-   (infinite)      🪣 Wrenna        (2 water → 1 food)     🧑‍🌾 Tomas      (village larder)
+   (infinite)      📐 Edda*         (2 water → 1 food)     🧑‍🌾 Tomas      (village larder)
 
   🌳 Greywood Grove ──(haul wood)──→ 🔥 Emberfall Forge ──(haul goods)──→ 🍺 The Rolling Pin Inn
    (infinite)       🌲 Pip          (2 wood → 1 goods)    ⚒️  Mira        (tavern, goods)
 
   🪨 Quarry ──(haul stone)──→ 🏗️ Building Sites (houses, wells, statues, lamps)
-   (infinite)
+   (infinite)      📐 Edda — designs & raises them, keeps the village well-ordered
+                   (*and keeps water moving when no build is underway)
 ```
 
 Each villager has a **trade** — their own link in the chain. They draw from
@@ -206,6 +207,39 @@ docker compose up --build
 ```
 
 Open **http://localhost:5173** — RabbitMQ admin at **http://localhost:15672** (`guest`/`guest`).
+
+### 🌍 Creating a village (first-run setup)
+
+On the **first boot with an empty database**, the app opens a **setup screen** in the
+browser. You choose how the village is born:
+
+- **✨ Auto-generate** — the LLM designs a village from a free-text **style** you type
+  or pick (Desert, Coast, Forest, Volcanic, Alien, …), a **villager count** and a
+  **size**. A live colour swatch previews the ground palette as you type. The model
+  names the places, picks the buildings, the themed ground colours and the personas;
+  the code packs them into a **tight, real-looking village cluster** and grounds the
+  minds in a themed world bible.
+- **🏡 Classic village** — the hand-crafted starter village (`villagers.json` +
+  `villagers.md`), instant, no LLM.
+
+```bash
+docker compose up --build       # then open the browser and pick on the setup screen
+```
+
+- Only **names, flavour, ground colours and layout** are themed — the fixed economy
+  (building kinds, the two production chains, the villager tools) is untouched, and the
+  generator **guarantees** a survivable, tightly-clustered map (both chains, a quarry,
+  a temple, one house per villager), repairing/packing whatever the model emits.
+- It's **robust**: every model output is validated/clamped/repaired, calls retry, and
+  generation **falls back to the classic village** if the model can't deliver — boot is
+  never blocked. Progress streams to a **live loading overlay** while it builds.
+- The result is **persisted**, so later boots just resume it. **Settings → New Village**
+  wipes the world and returns to the setup screen.
+- The village's theme shows as a 🏷️ chip in the top-bar HUD (tooltip = the setting).
+
+**Env knobs:** `GENERATE_LLM=off` hides the auto option (setup offers only Classic).
+`GENERATE_AUTO=on` skips the setup screen entirely and auto-generates headlessly with
+`GENERATE_THEME` / `MAX_GENERATE_VILLAGERS` (for dev/CI with no browser).
 
 ### Dev mode (hot reload)
 
@@ -247,10 +281,15 @@ RABBITMQ_URL=amqp://localhost:5672 MONGO_URL=mongodb://localhost:27017/simvillag
 | `RABBITMQ_URL` | `amqp://rabbitmq:5672` | AMQP broker URL |
 | `GATEWAY_WS_PORT` | `8080` | WebSocket port |
 | `WORLD_TICK_RATE` | `3` | Simulation ticks/sec |
-| `VILLAGER_COUNT` | `5` | How many minds to spawn |
+| `GENERATE_LLM` | `on` | Offer the LLM auto-generate option on the setup screen |
+| `GENERATE_AUTO` | — | Skip the setup screen; auto-generate headlessly (dev/CI) |
+| `GENERATE_THEME` | — | Prefills the style field / headless style (empty = model-invented) |
+| `MAX_GENERATE_VILLAGERS` | `6` | Villager-count ceiling (setup slider max) |
+| `VILLAGER_COUNT` | `5` | How many minds to spawn (classic mode only) |
 | `VILLAGER_THINK_INTERVAL_MS` | `12000` | Gap between a mind's LLM calls |
 | `VILLAGER_SENSE_RADIUS` | `8` | Base sensory radius (tiles) |
 | `VILLAGER_MEMORY` | `on` | Long-term RAG memory (needs Qdrant) |
+| `LLM_MAX_TOKENS` | — | Global completion-token cap for every llama call (raise for thinking models) |
 | `LLAMA_URLS` | `http://host.docker.internal:8080` | OpenAI-compatible llama endpoint |
 | `EMBED_URLS` | `http://embed:8080` | Embedding server endpoint |
 | `EMBED_DIM` | `768` | Vector dimension (match embedding model) |

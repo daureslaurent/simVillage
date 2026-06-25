@@ -18,7 +18,7 @@
 
 import type { Villager, VillagerNeeds, Tree, Building, CartPhase, ResourceKind, Vec2, WeatherKind } from '../../shared/types';
 import type { WorldInitPayload, WorldMapUpdatedPayload } from '../../shared/events';
-import { isDepleted, SERVICE_REACH } from '../../shared/buildings';
+import { isDepleted, isDepot, SERVICE_REACH } from '../../shared/buildings';
 import { sightRadius, hearingRadius, BASE_SENSE_RADIUS } from '../../shared/perception';
 
 /**
@@ -69,6 +69,12 @@ export interface PerceivedBuilding {
   capacity: number;
   /** True when the place has run dry and can no longer serve until refilled. */
   empty: boolean;
+  /**
+   * For a construction site only: the materials it still needs to be raised, by kind
+   * (its project's totals). Lets the mind see "haul wood here to finish it" rather than
+   * guess. Absent on finished buildings.
+   */
+  needs?: Partial<Record<ResourceKind, number>>;
 }
 
 /** A robot-cart the villager can sense, with its order/state so the mind can read it. */
@@ -116,6 +122,8 @@ export interface MapEntry {
   capacity: number;
   /** True when the place has run dry and can no longer serve until refilled. */
   empty: boolean;
+  /** For a construction site only: the materials it still needs to be raised, by kind. */
+  needs?: Partial<Record<ResourceKind, number>>;
 }
 
 /** The local, body-centred snapshot handed to the LLM. */
@@ -137,6 +145,8 @@ export interface Perception {
     id: string;
     position: Vec2;
     idle: boolean;
+    /** Whether the body is asleep right now — the mind is dark until it wakes at dawn. */
+    asleep: boolean;
     status: string;
     needs: VillagerNeeds;
     backpack: string[];
@@ -154,8 +164,18 @@ export interface Perception {
   nearbyObjects: PerceivedObject[];
   /** Village buildings within the sensory radius, nearest first. */
   nearbyBuildings: PerceivedBuilding[];
-  /** Robot-carts within the sensory radius, nearest first. */
+  /**
+   * Robot-carts within the sensory radius, nearest first. When standing at a technical
+   * depot ({@link atDepot}) this instead lists EVERY cart in the village, since a depot
+   * can dispatch any of them.
+   */
   nearbyCarts: PerceivedCart[];
+  /**
+   * True when the villager is standing at the technical depot — the cart-control
+   * station — and so may set the order of ANY cart in {@link nearbyCarts}, not just
+   * the ones it is physically beside.
+   */
+  atDepot: boolean;
 }
 
 /** Chebyshev (king-move) distance — the radius metric on a square grid. */
@@ -229,6 +249,7 @@ export class WorldView {
         stock,
         capacity: b.capacity ?? 0,
         empty: isDepleted(b.kind, stock),
+        ...(b.construction ? { needs: b.construction.required } : {}),
       };
     });
   }
@@ -326,10 +347,18 @@ export class WorldView {
           stock,
           capacity: b.capacity ?? 0,
           empty: isDepleted(b.kind, stock),
+          ...(b.construction ? { needs: b.construction.required } : {}),
         };
       })
       .filter((b) => b.distance <= sight)
       .sort((a, b) => a.distance - b.distance);
+
+    // Standing at the technical depot lets a villager dispatch ANY cart in the
+    // village, so when at a depot every cart is commandable AND visible (no need to
+    // see it), not just the ones within reach.
+    const atDepot = this.buildings.some(
+      (b) => isDepot(b.kind) && rectDistance(self.position, b) <= SERVICE_REACH,
+    );
 
     const nearbyCarts: PerceivedCart[] = (payload.carts ?? [])
       .map((c) => {
@@ -352,10 +381,10 @@ export class WorldView {
             : null,
           phase: c.phase,
           waitReason: c.waitReason,
-          canCommand: distance <= SERVICE_REACH,
+          canCommand: atDepot || distance <= SERVICE_REACH,
         };
       })
-      .filter((c) => c.distance <= sight)
+      .filter((c) => atDepot || c.distance <= sight)
       .sort((a, b) => a.distance - b.distance);
 
     const myGathering = (payload.gatherings ?? []).find((g) => g.memberIds.includes(this.selfId));
@@ -373,6 +402,7 @@ export class WorldView {
         id: self.id,
         position: self.position,
         idle: self.target === null,
+        asleep: self.asleep ?? false,
         status: self.status ?? 'Idle',
         needs: self.needs ?? { hunger: 0, thirst: 0, fatigue: 0 },
         backpack: self.backpack ?? [],
@@ -382,6 +412,7 @@ export class WorldView {
       nearbyObjects,
       nearbyBuildings,
       nearbyCarts,
+      atDepot,
     };
   }
 

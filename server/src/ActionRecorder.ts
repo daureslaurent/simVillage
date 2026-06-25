@@ -44,9 +44,13 @@ export class ActionRecorder {
         villagerName: t.villagerName,
         tick: t.tick,
         decision: t.decision,
+        decisionSource: t.decisionSource ?? 'llm',
         recalledMemories: t.recalledMemories,
         prompt: t.prompt,
         rawOutput: t.rawOutput,
+        // Persist the full agentic trace (lookups + actions) so the action log can
+        // replay how the villager reached this action, not just the action itself.
+        ...(t.steps && t.steps.length > 0 ? { steps: t.steps } : {}),
         recordedAt: new Date().toISOString(),
       })
       .catch((err) => {

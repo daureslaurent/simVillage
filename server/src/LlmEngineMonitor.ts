@@ -17,8 +17,8 @@
 import type { EventBus } from '../../bus/EventBus';
 import { makeEvent } from '../../bus/EventBus';
 import { EXCHANGES } from '../../shared/events';
-import type { LlmCallPurpose } from '../../shared/types';
-import type { LlmCallFinish, LlmCallMonitor, LlmCallStart } from '../../agent/src/llm/HttpLLMClient';
+import type { LlmCallPurpose, LlmUsage } from '../../shared/types';
+import type { LlmCallDelta, LlmCallFinish, LlmCallMonitor, LlmCallStart } from '../../agent/src/llm/HttpLLMClient';
 
 /** Longest preview string we put on the wire; prompts/replies are clipped to this. */
 const MAX_PREVIEW = 600;
@@ -44,6 +44,20 @@ export class LlmEngineMonitor implements LlmCallMonitor {
     );
   }
 
+  onDelta(call: LlmCallDelta): void {
+    // A streamed slice of an in-flight `/decide` call. Passed through verbatim —
+    // it is already small (one chunk), and the Live LLM window correlates it with
+    // the matching `started` event by id, so no enrichment is needed here.
+    this.bus.publish(
+      EXCHANGES.engineTelemetry,
+      makeEvent('engine.llm.delta', {
+        id: call.id,
+        ...(call.content ? { content: call.content } : {}),
+        ...(call.reasoning ? { reasoning: call.reasoning } : {}),
+      }),
+    );
+  }
+
   onFinish(call: LlmCallFinish): void {
     // No request body at finish time (see `LlmCallFinish`) — best-effort by
     // endpoint alone. The debug window prefers the matching start event's
@@ -62,9 +76,19 @@ export class LlmEngineMonitor implements LlmCallMonitor {
         response: call.ok ? previewResponse(call.endpoint, call.response) : '',
         ...(call.error ? { error: clip(call.error) } : {}),
         startedAt: call.startedAt,
+        ...(call.ok && call.endpoint === '/decide'
+          ? { toolCount: countToolCalls(call.response) }
+          : {}),
+        ...(call.ok ? attachUsage(call.response) : {}),
       }),
     );
   }
+}
+
+/** Pull the `usage` block off a successful reply (the /decide path carries it). */
+function attachUsage(response: unknown): { usage?: LlmUsage } {
+  const usage = (response as { usage?: LlmUsage } | undefined)?.usage;
+  return usage ? { usage } : {};
 }
 
 /** The caller tag every request body carries (set by the villager / supervisor / memory). */
@@ -105,7 +129,10 @@ function previewRequest(endpoint: string, request: unknown): string {
   if (!r) return '';
   if (endpoint === '/decide') {
     const tools = Array.isArray(r.tools) ? `  ·  ${r.tools.length} tools` : '';
-    return clip(`${asText(r.userMessage)}${tools}`);
+    // Agentic path carries a `messages` transcript; show the latest user/tool message.
+    // Legacy path carries a single `userMessage`.
+    const latest = Array.isArray(r.messages) ? latestMessageText(r.messages) : asText(r.userMessage);
+    return clip(`${latest}${tools}`);
   }
   if (endpoint === '/complete') return clip(asText(r.user));
   if (endpoint === '/embed') {
@@ -116,14 +143,35 @@ function previewRequest(endpoint: string, request: unknown): string {
   return clip(asText(r));
 }
 
+/**
+ * The tool calls a `/decide` reply emitted. The agentic path returns a `turn`
+ * (content + tool calls); the legacy path returns a single `call`.
+ */
+function toolCallsOf(r: Record<string, unknown>): Array<{ name?: string; input?: unknown }> {
+  return Array.isArray(r.toolCalls)
+    ? (r.toolCalls as Array<{ name?: string; input?: unknown }>)
+    : r.call
+      ? [r.call as { name?: string; input?: unknown }]
+      : [];
+}
+
+/** How many tool calls a successful `/decide` reply emitted. */
+function countToolCalls(response: unknown): number {
+  const r = response as Record<string, unknown> | undefined;
+  return r ? toolCallsOf(r).length : 0;
+}
+
 /** Human-readable preview of a successful reply. */
 function previewResponse(endpoint: string, response: unknown): string {
   const r = response as Record<string, unknown> | undefined;
   if (!r) return '';
   if (endpoint === '/decide') {
-    const call = r.call as { name?: string; input?: unknown } | null | undefined;
-    if (!call) return 'declined (no tool call)';
-    return clip(`${call.name ?? '?'}(${asText(call.input)})`);
+    const calls = toolCallsOf(r);
+    if (calls.length === 0) {
+      const content = asText(r.content);
+      return content ? clip(content) : 'yield (no tool call)';
+    }
+    return clip(calls.map((c) => `${c.name ?? '?'}(${asText(c.input)})`).join(', '));
   }
   if (endpoint === '/complete') return clip(asText(r.text));
   if (endpoint === '/embed') {
@@ -132,6 +180,22 @@ function previewResponse(endpoint: string, response: unknown): string {
     return `${vectors.length} vector(s)${dim ? ` · dim ${dim}` : ''}`;
   }
   return clip(asText(r));
+}
+
+/**
+ * The text of the most recent meaningful message in a transcript — the latest
+ * `tool` result or `user` turn — so the preview shows what the model is responding
+ * to right now (a fed-back lookup result, or the original perception), not the
+ * stale system prompt.
+ */
+function latestMessageText(messages: unknown[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string; content?: unknown; name?: string } | undefined;
+    if (!m) continue;
+    if (m.role === 'tool') return `↳ ${m.name ?? 'tool'}: ${asText(m.content)}`;
+    if (m.role === 'user') return asText(m.content);
+  }
+  return '';
 }
 
 /** Coerce any value to a single-line string for previewing. */

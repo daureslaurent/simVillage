@@ -23,6 +23,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import type { VillagerAppearance } from '../../shared/appearance';
 
 /** The static identity + current intent of a single villager. */
 export interface CharacterProfile {
@@ -38,6 +39,12 @@ export interface CharacterProfile {
   status: string;
   /** Optional flavour the model can draw on; omitted if empty. */
   backstory?: string;
+  /**
+   * The villager's procedural LOOK, generated alongside the persona on an LLM
+   * world build so each inhabitant is visually distinct. Carried here so it lives
+   * with the rest of the identity; the seed copies it onto the villager body.
+   */
+  appearance?: VillagerAppearance;
 }
 
 /** A sensible default villager, used when no env-supplied profile is given. */

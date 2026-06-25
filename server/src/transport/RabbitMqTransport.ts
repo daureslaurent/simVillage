@@ -177,8 +177,16 @@ export class RabbitMqTransport implements Transport {
       case 'villager.propose_build': {
         // The engine opens the construction site; the GroupCoordinator (a separate
         // consumer of this same intent) opens the matching village build plan.
-        const { villagerId, structure, name, x, y } = event.payload;
-        this.engine.dispatchCommand({ command: 'villager_start_build', villagerId, structure, name, x, y });
+        const { villagerId, structure, name, description, x, y } = event.payload;
+        this.engine.dispatchCommand({
+          command: 'villager_start_build',
+          villagerId,
+          structure,
+          name,
+          ...(description ? { description } : {}),
+          x,
+          y,
+        });
         return;
       }
       case 'villager.command_cart': {
@@ -227,6 +235,9 @@ export class RabbitMqTransport implements Transport {
       trees: message.trees,
       buildings: message.buildings,
       weather: message.weather,
+      ...(message.theme ? { theme: message.theme } : {}),
+      ...(message.setting ? { setting: message.setting } : {}),
+      ...(message.palette ? { palette: message.palette } : {}),
     };
     this.bus.publish(EXCHANGES.worldEvents, makeEvent('world.init', payload));
   }

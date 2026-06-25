@@ -131,23 +131,30 @@ export const SOURCE_RESOURCE: Partial<Record<BuildingKind, ResourceKind>> = {
 };
 
 /**
- * Output units produced per tick by a converter with NO villager working — the
- * slow passive trickle of an unattended farm. Capped by available input + space.
+ * Output units produced per in-world ROUND by a converter with NO villager working
+ * — the slow passive trickle of an unattended farm. Capped by available input +
+ * space. (Production advances with the in-world clock, not the physics loop.)
  */
-export const PASSIVE_CONVERT_RATE = 0.05;
+export const PASSIVE_CONVERT_RATE = 0.2;
 
 /**
- * Output units produced per tick by a converter WITH a villager working there —
- * the fast hands-on rate. Tends the {@link Conversion} much quicker than passive.
+ * Output units produced per in-world ROUND by a converter WITH a villager working
+ * there — the fast hands-on rate. Tends the {@link Conversion} much quicker than
+ * passive, so a short work session visibly fills the store.
  */
-export const WORKER_CONVERT_RATE = 0.5;
+export const WORKER_CONVERT_RATE = 2.0;
 
 // ---------------------------------------------------------------------------
 // Consumption
 // ---------------------------------------------------------------------------
 
-/** A villager consumes one unit of a resource every this many ticks. */
-export const CONSUME_INTERVAL_TICKS = 5;
+/**
+ * A villager checks whether to eat/drink/unwind once every this many in-world
+ * ROUNDS. One round means "every round" — the consume {@link NEED_CONSUME_THRESHOLD}
+ * gate then decides how OFTEN they actually consume, so this stays at the clock's
+ * resolution rather than the physics loop's.
+ */
+export const CONSUME_INTERVAL_ROUNDS = 1;
 
 /** How much one consumed unit lowers the matching need (0..100 pressure). */
 export const NEED_RELIEF_PER_UNIT = 30;
@@ -252,6 +259,8 @@ export const BUILDING_COLORS: Record<BuildingKind, string> = {
   construction_site: '#c9b063',
   monument: '#b9c2cc',
   lamp: '#e8c95a',
+  landmark: '#a98fd0',
+  depot: '#4a6b8c',
 };
 
 /**
@@ -273,7 +282,58 @@ export const BUILDING_FUNCTIONS: Record<BuildingKind, string> = {
   construction_site: 'a building site — haul stone and wood here to raise it',
   monument: 'a proud monument that lifts the spirits of all who pass by',
   lamp: 'a standing lamp that warms and brightens its corner of the village',
+  // A generic fallback for an invented structure; in practice a finished landmark
+  // carries the villagers' OWN description (see ConstructionState.description), so
+  // this line shows only when none was given.
+  landmark: 'a landmark the villagers raised together',
+  depot: 'the technical station from which any robot-cart can be dispatched to haul for the village',
 };
+
+// ---------------------------------------------------------------------------
+// World GENERATION — the building kinds an LLM may lay down when generating a
+// fresh village, and the survivability floor it must always satisfy.
+// ---------------------------------------------------------------------------
+
+/**
+ * The building kinds the LLM world generator may place. Deliberately the FIXED,
+ * mechanically-meaningful set: the two production chains, the stores, the civic
+ * places and homes. The runtime-only kinds (`construction_site`, and the
+ * villager-raised `monument` / `lamp` / `landmark`) are excluded — those are
+ * raised during play, never seeded. A generated map is themed only in NAMES and
+ * placement; which kinds exist (and so the economy) stays within this catalog.
+ */
+export const GENERATABLE_KINDS: readonly BuildingKind[] = [
+  'water_source',
+  'greenfield',
+  'lumber_source',
+  'workshop',
+  'hall_town',
+  'tavern',
+  'temple',
+  'quarry',
+  'house',
+  'depot',
+];
+
+/**
+ * The survivability FLOOR a generated village must meet, however the LLM themes
+ * it: at least one of each kind that the survival loop and the two chains depend
+ * on. The generator augments any missing kind after the model has had its say, so
+ * an over-eager theme can never produce a village that cannot feed, water, or
+ * house itself. `house` is handled separately (one per villager), so it is not
+ * listed here.
+ */
+export const REQUIRED_KINDS: readonly BuildingKind[] = [
+  'water_source', // draw water (chain 1 source)
+  'greenfield', //   water -> food (chain 1 converter)
+  'hall_town', //    food + water store villagers eat/drink from
+  'lumber_source', // gather wood (chain 2 source)
+  'workshop', //     wood -> goods (chain 2 converter)
+  'tavern', //       goods relieve boredom
+  'quarry', //       stone for building toward a town
+  'temple', //       prayer to the watching god
+  'depot', //        cart-control station: dispatch any robot-cart from one place
+];
 
 // ---------------------------------------------------------------------------
 // Buildable structures — what the village can RAISE together.
@@ -343,6 +403,14 @@ export const BUILDABLES: Record<BuildableId, Buildable> = {
     height: 1,
     cost: { goods: 6, stone: 4 },
   },
+  depot: {
+    kind: 'depot',
+    label: 'a technical depot',
+    why: 'a control station from which a villager can dispatch ANY robot-cart in the village, so the whole haulage fleet is driven from one place instead of walking out to each cart',
+    width: 3,
+    height: 3,
+    cost: { stone: 14, wood: 10 },
+  },
   handcart: {
     producesCart: 'handcart',
     label: 'a handcart',
@@ -358,6 +426,19 @@ export const BUILDABLES: Record<BuildableId, Buildable> = {
     width: 2,
     height: 2,
     cost: { wood: 18, goods: 10, stone: 8 },
+  },
+  // The OPEN-ENDED buildable: a structure the villagers INVENT for themselves —
+  // a market, a wall, a meeting house, a shrine, anything the catalog never named.
+  // It finishes into a generic `landmark` whose function carries the proposer's own
+  // description. A moderate stone-and-wood cost so any sizeable addition is a real,
+  // shared effort; its footprint is a comfortable default for an unspecified thing.
+  custom: {
+    kind: 'landmark',
+    label: 'a new structure',
+    why: 'something the village dreams up for itself — a market, a wall, a meeting house, a shrine — to grow beyond a mere cluster of huts toward a true town',
+    width: 3,
+    height: 3,
+    cost: { stone: 18, wood: 8 },
   },
 };
 
@@ -406,6 +487,16 @@ export function isConstructionSite(kind: BuildingKind): boolean {
   return kind === 'construction_site';
 }
 
+/**
+ * True when a building kind is the technical depot — the cart-control station. A
+ * villager standing within {@link SERVICE_REACH} of a depot may command ANY cart in
+ * the village, not just one it is standing beside (see the engine's command_cart and
+ * the agent's cart perception).
+ */
+export function isDepot(kind: BuildingKind): boolean {
+  return kind === 'depot';
+}
+
 // ---------------------------------------------------------------------------
 // Ambience — the passive lift a villager-raised adornment gives its surroundings.
 // ---------------------------------------------------------------------------
@@ -419,6 +510,9 @@ export function isConstructionSite(kind: BuildingKind): boolean {
 export const BUILDING_AMBIENCE: Partial<Record<BuildingKind, number>> = {
   monument: 0.5,
   lamp: 0.25,
+  // An invented landmark gladdens its surroundings like a monument — the tangible
+  // payoff that makes building toward a city worth the village's effort.
+  landmark: 0.5,
 };
 
 /** How far (Chebyshev tiles, from the footprint edge) an adornment's ambience reaches. */
@@ -427,4 +521,52 @@ export const AMBIENCE_RADIUS = 6;
 /** The per-tick boredom relief a building kind radiates, or 0 if it is not an adornment. */
 export function buildingAmbience(kind: BuildingKind): number {
   return BUILDING_AMBIENCE[kind] ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// The building GUIDE — the single source of truth for "what this place is and how
+// you use it", in plain prose. Shared so the villagers' `building_guide` read tool
+// AND the browser's building inspector describe a place identically (one voice, no
+// drift). Derived entirely from the frozen tables above, so it stays dependency-free.
+// ---------------------------------------------------------------------------
+
+/**
+ * Plain-prose lines describing a building KIND: its role in the economy and how a
+ * villager interacts with it (work / take / give / nothing). The first line is its
+ * {@link BUILDING_FUNCTIONS} purpose; the rest spell out the mechanics so a mind (or
+ * a curious onlooker) knows exactly how to act on it. Joined with newlines by the
+ * callers that want a single string.
+ */
+export function buildingGuideLines(kind: BuildingKind): string[] {
+  const fn = BUILDING_FUNCTIONS[kind];
+  const lines: string[] = [`The ${kind.replace(/_/g, ' ')} — ${fn}.`];
+
+  const conv = buildingConversion(kind);
+  if (conv) {
+    lines.push(
+      `It is a CONVERTER: stock it with ${conv.input}, then WORK there (work_at) to turn ${conv.input} into ${conv.output} ` +
+        `(about ${conv.inputPerOutput} ${conv.input} per ${conv.output}). It also trickles slowly on its own.`,
+    );
+  }
+  if (isSource(kind)) {
+    const r = sourceResource(kind);
+    lines.push(
+      `It is an inexhaustible SOURCE of ${r}: stand beside it and TAKE (take_from) as much ${r} as your backpack holds — no work needed.`,
+    );
+  }
+  const stocks = buildingStockKinds(kind);
+  if (stocks.length > 0 && !isSource(kind) && !conv) {
+    lines.push(`It STORES ${stocks.join(' and ')}: take_from it to draw some, or give_to it to stock it.`);
+  }
+  if (kind === 'construction_site') {
+    lines.push('It is a BUILDING SITE: haul the materials it still needs and give_to it; once every material is in, it is raised.');
+  }
+  if (kind === 'depot') {
+    lines.push('Stand here to DISPATCH any robot-cart in the village (command_cart) — the whole haulage fleet is driven from this one place.');
+  }
+  if (!isWorkable(kind) && !isSource(kind) && stocks.length === 0 && kind !== 'construction_site' && kind !== 'depot') {
+    lines.push('You do not work or haul here; it serves the village in its own way.');
+  }
+  lines.push('Stand within a few tiles of it before you work, take, or give there.');
+  return lines;
 }
