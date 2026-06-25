@@ -236,7 +236,7 @@ services:
     networks: [edge]
     # Host 5173 (the familiar dev URL) -> nginx :80 inside the container.
     ports:
-      - "5173:80"
+      - "5172:80"
 
 networks:
   # The engine room — backend talks to mongo/qdrant/llm here. No host exposure.
