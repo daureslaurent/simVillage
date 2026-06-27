@@ -13,7 +13,7 @@
  */
 
 import type { Building, BuildingKind, Cart, ResourceKind, TerrainPalette, Villager, Tree, Vec2, WorldSeed } from '../../../shared/types';
-import { DEFAULT_TERRAIN_PALETTE } from '../../../shared/types';
+import { DEFAULT_TERRAIN_PALETTE, DEFAULT_VILLAGE_ID, RIVAL_VILLAGE_ID } from '../../../shared/types';
 import { deriveAppearance } from '../../../shared/appearance';
 import {
   BUILDING_CAPACITY,
@@ -29,6 +29,9 @@ export const DEFAULT_HEIGHT = 500;
 
 /** A small palette so the handful of starter villagers are visually distinct. */
 const VILLAGER_COLORS = ['#ff4d4d', '#4dafff', '#ffd24d', '#9b5dff', '#4dffa1', '#ff9f4d'];
+
+/** A cooler palette for the RIVAL village (v3 P5), so the two sides read apart on the map. */
+const RIVAL_VILLAGER_COLORS = ['#1f9e8a', '#7b68ee', '#2e8bd0', '#5fa83a', '#c060c0', '#3aa0a0'];
 
 /**
  * The resources a villager might start out carrying. The backpack holds
@@ -136,15 +139,17 @@ export function generateSeed(options: GenerateOptions = {}): WorldSeed {
     const bp = VILLAGE_BLUEPRINT[i]!;
     const x = clamp(cx + bp.dx, 0, width - bp.w);
     const y = clamp(cy + bp.dy, 0, height - bp.h);
-    // Seed each building partly stocked (40–100%) so some places run dry during
-    // play and villagers have a reason to go refill them from the very first day.
+    // Seed each building lightly stocked (15–45%) so the larder starts BELOW the
+    // brain's maintenance targets — villagers have real work to do from tick one
+    // instead of standing idle on a full world.
     const stock: Partial<Record<ResourceKind, number>> = {};
     for (const r of buildingStockKinds(bp.kind)) {
-      stock[r] = randInt(Math.floor(BUILDING_CAPACITY * 0.4), BUILDING_CAPACITY + 1);
+      stock[r] = randInt(Math.floor(BUILDING_CAPACITY * 0.15), Math.floor(BUILDING_CAPACITY * 0.45) + 1);
     }
     buildings.push({
       id: `building_${bp.kind}_${i}`,
       type: 'building',
+      villageId: DEFAULT_VILLAGE_ID,
       kind: bp.kind,
       name: bp.name,
       function: BUILDING_FUNCTIONS[bp.kind],
@@ -181,6 +186,7 @@ export function generateSeed(options: GenerateOptions = {}): WorldSeed {
       // the id is a safe placeholder.
       name: id,
       type: 'villager',
+      villageId: DEFAULT_VILLAGE_ID,
       position: pos,
       target: null,
       color,
@@ -218,6 +224,7 @@ export function generateSeed(options: GenerateOptions = {}): WorldSeed {
     carts.push({
       id: 'cart_0',
       type: 'cart',
+      villageId: DEFAULT_VILLAGE_ID,
       name: `${spec.label} 1`,
       tier: 'handcart',
       width: spec.width,
@@ -236,6 +243,208 @@ export function generateSeed(options: GenerateOptions = {}): WorldSeed {
   }
 
   return { width, height, trees, villagers, buildings, carts, palette: DEFAULT_TERRAIN_PALETTE };
+}
+
+// ---------------------------------------------------------------------------
+// v3 P5 — TWO villages: a home settlement and a rival, on a wider shared map
+// (design §10, soft competition). Each cluster is the same hand-authored blueprint,
+// laid down around its own centre and stamped with its `villageId`, so every entity
+// is owned by exactly one side. They sit far apart with a contested middle the gods
+// can send raiders across. Building/cart ids are namespaced by village so the two
+// clusters' ids never collide.
+// ---------------------------------------------------------------------------
+
+/** One placed village cluster: its owned buildings, villagers and cart. */
+interface VillageCluster {
+  buildings: Building[];
+  villagers: Villager[];
+  carts: Cart[];
+}
+
+/**
+ * Lay one village's blueprint down around (cx, cy): its buildings (claiming their
+ * footprints in the shared `occupied` set), its villagers gathered at the square, and a
+ * starter handcart. Everything is stamped with `villageId`, and building/cart ids are
+ * namespaced by it so a second cluster on the same map never collides. Trees are NOT
+ * placed here — the caller fills the rest of the map around all clusters at once.
+ */
+function placeVillageCluster(opts: {
+  cx: number;
+  cy: number;
+  villageId: string;
+  villagerIds: string[];
+  width: number;
+  height: number;
+  occupied: Set<string>;
+  /** Villager colour palette for this side (home vs rival read apart). */
+  colors: readonly string[];
+}): VillageCluster {
+  const { cx, cy, villageId, villagerIds, width, height, occupied, colors } = opts;
+
+  const buildings: Building[] = [];
+  for (let i = 0; i < VILLAGE_BLUEPRINT.length; i++) {
+    const bp = VILLAGE_BLUEPRINT[i]!;
+    const x = clamp(cx + bp.dx, 0, width - bp.w);
+    const y = clamp(cy + bp.dy, 0, height - bp.h);
+    buildings.push({
+      id: `building_${villageId}_${bp.kind}_${i}`,
+      type: 'building',
+      villageId,
+      kind: bp.kind,
+      name: bp.name,
+      function: BUILDING_FUNCTIONS[bp.kind],
+      position: { x, y },
+      width: bp.w,
+      height: bp.h,
+      color: BUILDING_COLORS[bp.kind],
+      capacity: BUILDING_CAPACITY,
+      stock: seedStock(bp.kind),
+    });
+    claimFootprint(occupied, x, y, bp.w, bp.h);
+  }
+
+  const villagers: Villager[] = villagerIds.map((id, i) => {
+    const pos = freeTileNear(width, height, occupied, cx, cy, 14);
+    occupied.add(tileKey(pos.x, pos.y));
+    const color = colors[i % colors.length]!;
+    return {
+      id,
+      name: id,
+      type: 'villager',
+      villageId,
+      position: pos,
+      target: null,
+      color,
+      appearance: deriveAppearance(id, color),
+      speed: 2,
+      status: 'Idle',
+      needs: {
+        hunger: randInt(10, 45),
+        thirst: randInt(10, 45),
+        fatigue: randInt(5, 35),
+        boredom: randInt(10, 40),
+      },
+      backpack: pickItems(randInt(0, 3)),
+      task: null,
+      asleep: false,
+    };
+  });
+
+  const carts: Cart[] = [];
+  {
+    const spec = cartSpecFor('handcart');
+    const at = freeTileNear(width, height, occupied, cx, cy, 10);
+    claimFootprint(occupied, at.x, at.y, spec.width, spec.height);
+    carts.push({
+      id: `cart_${villageId}_0`,
+      type: 'cart',
+      villageId,
+      name: `${spec.label} 1`,
+      tier: 'handcart',
+      width: spec.width,
+      height: spec.height,
+      position: at,
+      target: null,
+      color: spec.color,
+      speed: spec.speed,
+      capacity: spec.capacity,
+      cargo: [],
+      order: null,
+      phase: 'idle',
+      waitReason: null,
+      lastCommandedBy: null,
+    });
+  }
+
+  return { buildings, villagers, carts };
+}
+
+export interface RivalSeedOptions {
+  width?: number;
+  height?: number;
+  treeCount?: number;
+}
+
+/**
+ * Produce a TWO-village world: the home settlement ({@link DEFAULT_VILLAGE_ID}) on the
+ * west and a rival ({@link RIVAL_VILLAGE_ID}) on the east of a wide shared map, with a
+ * forest filling the contested middle and edges. Each side owns its own buildings,
+ * villagers and cart. The rosters supply the ids for each side (so each lines up with a
+ * mind/profile); names are stamped at boot like the single-village seed.
+ */
+export function generateRivalSeed(
+  homeIds: string[],
+  rivalIds: string[],
+  options: RivalSeedOptions = {},
+): WorldSeed {
+  // A wider map than the single village, so two clusters sit comfortably apart with a
+  // contested middle a raiding party must cross.
+  const width = options.width ?? 760;
+  const height = options.height ?? 500;
+  const treeCount = options.treeCount ?? 500;
+  const occupied = new Set<string>();
+
+  const cores = [
+    { cx: Math.floor(width * 0.24), cy: Math.floor(height / 2) },
+    { cx: Math.floor(width * 0.76), cy: Math.floor(height / 2) },
+  ];
+  const home = placeVillageCluster({
+    cx: cores[0]!.cx,
+    cy: cores[0]!.cy,
+    villageId: DEFAULT_VILLAGE_ID,
+    villagerIds: homeIds,
+    width,
+    height,
+    occupied,
+    colors: VILLAGER_COLORS,
+  });
+  const rival = placeVillageCluster({
+    cx: cores[1]!.cx,
+    cy: cores[1]!.cy,
+    villageId: RIVAL_VILLAGE_ID,
+    villagerIds: rivalIds,
+    width,
+    height,
+    occupied,
+    colors: RIVAL_VILLAGER_COLORS,
+  });
+
+  // Trees fill the rest, kept clear of BOTH cluster cores so each square stays walkable.
+  const trees: Tree[] = [];
+  for (let i = 0; i < treeCount; i++) {
+    const pos = freeTileAwayFromCores(width, height, occupied, cores, 32);
+    if (!pos) break;
+    occupied.add(tileKey(pos.x, pos.y));
+    trees.push({ id: `tree_${i}`, type: 'tree', position: pos });
+  }
+
+  return {
+    width,
+    height,
+    trees,
+    villagers: [...home.villagers, ...rival.villagers],
+    buildings: [...home.buildings, ...rival.buildings],
+    carts: [...home.carts, ...rival.carts],
+    palette: DEFAULT_TERRAIN_PALETTE,
+  };
+}
+
+/** A free tile at least `keepOut` tiles from EVERY cluster core (keeps both squares clear). */
+function freeTileAwayFromCores(
+  width: number,
+  height: number,
+  occupied: Set<string>,
+  cores: { cx: number; cy: number }[],
+  keepOut: number,
+): Vec2 | null {
+  for (let attempt = 0; attempt < 10000; attempt++) {
+    const x = randInt(0, width);
+    const y = randInt(0, height);
+    if (occupied.has(tileKey(x, y))) continue;
+    if (cores.some((c) => fromCenter(x, y, c.cx, c.cy) < keepOut)) continue;
+    return { x, y };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +495,7 @@ export const DEFAULT_VILLAGE_MARGIN = 2;
 function seedStock(kind: BuildingKind): Partial<Record<ResourceKind, number>> {
   const stock: Partial<Record<ResourceKind, number>> = {};
   for (const r of buildingStockKinds(kind)) {
-    stock[r] = randInt(Math.floor(BUILDING_CAPACITY * 0.4), BUILDING_CAPACITY + 1);
+    stock[r] = randInt(Math.floor(BUILDING_CAPACITY * 0.15), Math.floor(BUILDING_CAPACITY * 0.45) + 1);
   }
   return stock;
 }
@@ -343,9 +552,20 @@ function packVillage(
   width: number,
   height: number,
   margin: number,
+  opts: {
+    /** Centre to pack around; defaults to the map centre. */
+    cx?: number;
+    cy?: number;
+    /**
+     * A SHARED occupancy set to pack into, so several clusters laid on one map never
+     * overlap each other. Defaults to a fresh set (a lone village). Buildings placed
+     * here are claimed into it.
+     */
+    occupied?: Set<string>;
+  } = {},
 ): PlacedBuilding[] {
-  const cx = width / 2;
-  const cy = height / 2;
+  const cx = opts.cx ?? width / 2;
+  const cy = opts.cy ?? height / 2;
 
   // Each building's intended bearing + distance from the model's own centroid.
   const centers = items.map((bp) => ({ bp, mx: bp.x + bp.w / 2, my: bp.y + bp.h / 2 }));
@@ -364,7 +584,7 @@ function packVillage(
   // structures take the middle and the rest pack snugly around them.
   ranked.sort((a, b) => a.dist - b.dist || b.c.bp.w * b.c.bp.h - a.c.bp.w * a.c.bp.h);
 
-  const occupied = new Set<string>();
+  const occupied = opts.occupied ?? new Set<string>();
   const placed: PlacedBuilding[] = [];
   const maxR = Math.max(width, height);
 
@@ -414,6 +634,7 @@ export function buildSeedFromPlan(plan: WorldPlan, villagerIds: string[]): World
     return {
       id: `building_${pb.bp.kind}_${i}`,
       type: 'building',
+      villageId: DEFAULT_VILLAGE_ID,
       kind: pb.bp.kind,
       name: pb.bp.name,
       function: BUILDING_FUNCTIONS[pb.bp.kind],
@@ -485,6 +706,7 @@ export function buildSeedFromPlan(plan: WorldPlan, villagerIds: string[]): World
       id,
       name: id,
       type: 'villager',
+      villageId: DEFAULT_VILLAGE_ID,
       position: pos,
       target: null,
       color,
@@ -512,6 +734,7 @@ export function buildSeedFromPlan(plan: WorldPlan, villagerIds: string[]): World
     carts.push({
       id: 'cart_0',
       type: 'cart',
+      villageId: DEFAULT_VILLAGE_ID,
       name: `${spec.label} 1`,
       tier: 'handcart',
       width: spec.width,
@@ -541,6 +764,221 @@ export function buildSeedFromPlan(plan: WorldPlan, villagerIds: string[]): World
   if (plan.theme) seed.theme = plan.theme;
   if (plan.setting) seed.setting = plan.setting;
   return seed;
+}
+
+// ---------------------------------------------------------------------------
+// LLM-generated TWO-village worlds: lay two generated PLANS down as a home + a
+// rival cluster on a wide shared map (the LLM counterpart of `generateRivalSeed`,
+// which uses the fixed blueprint). Each plan keeps its own theme/buildings/roster;
+// both are packed around their own core into one shared occupancy set so the
+// clusters never overlap, with a forest filling the contested middle.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pack one generated {@link WorldPlan} into a cluster around (cx, cy): its buildings
+ * (ids namespaced + stamped with `villageId`, claimed into the shared `occupied`
+ * set), its villagers gathered at the packed centroid, and a starter handcart.
+ * Returns the cluster plus its radius, so the caller can keep trees clear of it.
+ */
+function clusterFromPlan(opts: {
+  plan: WorldPlan;
+  villageId: string;
+  villagerIds: string[];
+  width: number;
+  height: number;
+  cx: number;
+  cy: number;
+  margin: number;
+  occupied: Set<string>;
+  colors: readonly string[];
+}): { cluster: VillageCluster; radius: number } {
+  const { plan, villageId, villagerIds, width, height, cx, cy, margin, occupied, colors } = opts;
+
+  const placed = packVillage(plan.buildings, width, height, margin, { cx, cy, occupied });
+  const buildings: Building[] = placed.map((pb, i) => ({
+    id: `building_${villageId}_${pb.bp.kind}_${i}`,
+    type: 'building',
+    villageId,
+    kind: pb.bp.kind,
+    name: pb.bp.name,
+    function: BUILDING_FUNCTIONS[pb.bp.kind],
+    position: { x: pb.x, y: pb.y },
+    width: pb.w,
+    height: pb.h,
+    color: BUILDING_COLORS[pb.bp.kind],
+    capacity: BUILDING_CAPACITY,
+    stock: seedStock(pb.bp.kind),
+  }));
+
+  // The packed centroid + radius: villagers spawn in its midst, trees keep clear of it.
+  const ccx = buildings.length
+    ? Math.round(buildings.reduce((s, b) => s + b.position.x + b.width / 2, 0) / buildings.length)
+    : cx;
+  const ccy = buildings.length
+    ? Math.round(buildings.reduce((s, b) => s + b.position.y + b.height / 2, 0) / buildings.length)
+    : cy;
+  const radius = buildings.reduce((max, b) => {
+    const corner = Math.max(
+      Math.hypot(b.position.x - ccx, b.position.y - ccy),
+      Math.hypot(b.position.x + b.width - ccx, b.position.y + b.height - ccy),
+    );
+    return Math.max(max, corner);
+  }, 12);
+
+  const villagers: Villager[] = villagerIds.map((id, i) => {
+    const pos = freeTileNear(width, height, occupied, ccx, ccy, 16);
+    occupied.add(tileKey(pos.x, pos.y));
+    const color = colors[i % colors.length]!;
+    return {
+      id,
+      name: id,
+      type: 'villager',
+      villageId,
+      position: pos,
+      target: null,
+      color,
+      appearance: deriveAppearance(id, color),
+      speed: 2,
+      status: 'Idle',
+      needs: {
+        hunger: randInt(10, 45),
+        thirst: randInt(10, 45),
+        fatigue: randInt(5, 35),
+        boredom: randInt(10, 40),
+      },
+      backpack: pickItems(randInt(0, 3)),
+      task: null,
+      asleep: false,
+    };
+  });
+
+  const carts: Cart[] = [];
+  {
+    const spec = cartSpecFor('handcart');
+    const at = freeTileNear(width, height, occupied, ccx, ccy, 10);
+    claimFootprint(occupied, at.x, at.y, spec.width, spec.height);
+    carts.push({
+      id: `cart_${villageId}_0`,
+      type: 'cart',
+      villageId,
+      name: `${spec.label} 1`,
+      tier: 'handcart',
+      width: spec.width,
+      height: spec.height,
+      position: at,
+      target: null,
+      color: spec.color,
+      speed: spec.speed,
+      capacity: spec.capacity,
+      cargo: [],
+      order: null,
+      phase: 'idle',
+      waitReason: null,
+      lastCommandedBy: null,
+    });
+  }
+
+  return { cluster: { buildings, villagers, carts }, radius };
+}
+
+/**
+ * Assemble a valid TWO-village {@link WorldSeed} from two generated plans — the home
+ * settlement ({@link DEFAULT_VILLAGE_ID}) on the west and a rival ({@link
+ * RIVAL_VILLAGE_ID}) on the east of a wide shared map, with a forest filling the
+ * contested middle. The map ground takes the HOME plan's palette (one ground covers
+ * the shared valley); each cluster keeps its own buildings, names and roster.
+ */
+export function buildRivalSeedFromPlans(
+  home: { plan: WorldPlan; villagerIds: string[] },
+  rival: { plan: WorldPlan; villagerIds: string[] },
+  options: RivalSeedOptions = {},
+): WorldSeed {
+  const width = options.width ?? 760;
+  const height = options.height ?? 500;
+  const occupied = new Set<string>();
+
+  const cores = [
+    { cx: Math.floor(width * 0.24), cy: Math.floor(height / 2) },
+    { cx: Math.floor(width * 0.76), cy: Math.floor(height / 2) },
+  ];
+  const homeCluster = clusterFromPlan({
+    plan: home.plan,
+    villageId: DEFAULT_VILLAGE_ID,
+    villagerIds: home.villagerIds,
+    width,
+    height,
+    cx: cores[0]!.cx,
+    cy: cores[0]!.cy,
+    margin: clamp(Math.round(home.plan.margin ?? DEFAULT_VILLAGE_MARGIN), 0, 8),
+    occupied,
+    colors: VILLAGER_COLORS,
+  });
+  const rivalCluster = clusterFromPlan({
+    plan: rival.plan,
+    villageId: RIVAL_VILLAGE_ID,
+    villagerIds: rival.villagerIds,
+    width,
+    height,
+    cx: cores[1]!.cx,
+    cy: cores[1]!.cy,
+    margin: clamp(Math.round(rival.plan.margin ?? DEFAULT_VILLAGE_MARGIN), 0, 8),
+    occupied,
+    colors: RIVAL_VILLAGER_COLORS,
+  });
+
+  // Trees fill the rest, kept clear of BOTH cluster cores by each one's own radius, so
+  // the two squares + their lanes stay walkable and the forest holds the middle.
+  const clearings = [
+    { cx: cores[0]!.cx, cy: cores[0]!.cy, keepOut: homeCluster.radius + 6 },
+    { cx: cores[1]!.cx, cy: cores[1]!.cy, keepOut: rivalCluster.radius + 6 },
+  ];
+  const treeCount = clamp(
+    Math.round((home.plan.treeCount ?? 0) + (rival.plan.treeCount ?? 0)),
+    0,
+    Math.floor((width * height) / 20),
+  );
+  const trees: Tree[] = [];
+  for (let i = 0; i < treeCount; i++) {
+    const pos = freeTileClearOfCores(width, height, occupied, clearings);
+    if (!pos) break;
+    occupied.add(tileKey(pos.x, pos.y));
+    trees.push({ id: `tree_${i}`, type: 'tree', position: pos });
+  }
+
+  const seed: WorldSeed = {
+    width,
+    height,
+    trees,
+    villagers: [...homeCluster.cluster.villagers, ...rivalCluster.cluster.villagers],
+    buildings: [...homeCluster.cluster.buildings, ...rivalCluster.cluster.buildings],
+    carts: [...homeCluster.cluster.carts, ...rivalCluster.cluster.carts],
+    // Two grounds on one map: the home palette paints WEST of the midline, the rival
+    // palette EAST, so each settlement reads in its own terrain. The split is the
+    // territory midline, halfway between the two cores.
+    palette: home.plan.palette ?? DEFAULT_TERRAIN_PALETTE,
+    rivalPalette: rival.plan.palette ?? DEFAULT_TERRAIN_PALETTE,
+    paletteSplitX: Math.floor(width / 2),
+  };
+  if (home.plan.theme) seed.theme = home.plan.theme;
+  if (home.plan.setting) seed.setting = home.plan.setting;
+  return seed;
+}
+
+/** A free tile at least each core's `keepOut` tiles away from every core centre. */
+function freeTileClearOfCores(
+  width: number,
+  height: number,
+  occupied: Set<string>,
+  cores: { cx: number; cy: number; keepOut: number }[],
+): Vec2 | null {
+  for (let attempt = 0; attempt < 10000; attempt++) {
+    const x = randInt(0, width);
+    const y = randInt(0, height);
+    if (occupied.has(tileKey(x, y))) continue;
+    if (cores.some((c) => Math.hypot(x - c.cx, y - c.cy) < c.keepOut)) continue;
+    return { x, y };
+  }
+  return null;
 }
 
 function clamp(v: number, lo: number, hi: number): number {

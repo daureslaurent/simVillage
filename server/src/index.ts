@@ -43,6 +43,11 @@ import {
   type VillageSize,
   type VillagerMemory,
   type VillagerPersona,
+  type RivalSetupParams,
+  type CompetitionIntensity,
+  DEFAULT_COMPETITION_INTENSITY,
+  DEFAULT_VILLAGE_ID,
+  RIVAL_VILLAGE_ID,
 } from '../../shared/types';
 import { WorldEngine } from './WorldEngine';
 import { MongoWorldStore } from './persistence/MongoWorldStore';
@@ -63,23 +68,38 @@ import { DailyReportRecorder } from './DailyReportRecorder';
 import { RelationshipTracker } from './RelationshipTracker';
 import { GroupCoordinator } from './GroupCoordinator';
 import { AgendaCoordinator } from './AgendaCoordinator';
+import { MomentCoordinator } from './MomentCoordinator';
 import { BuildingLog } from './BuildingLog';
 import { MindScheduler } from './MindScheduler';
 import { MindRegistry } from './MindRegistry';
 import { RabbitMqTransport } from './transport/RabbitMqTransport';
 import type { Transport } from './transport/Transport';
 import { DailySummaryAggregator } from './DailySummaryAggregator';
-import { generateSeed } from './world/seed';
-import { generateWorldWithLLM, previewStyle } from './world/llmGenerate';
+import { generateSeed, generateRivalSeed } from './world/seed';
+import { generateWorldWithLLM, generateRivalWorldWithLLM, previewStyle } from './world/llmGenerate';
 import { IngressGateway } from '../../gateway/src/IngressGateway';
 import { SupervisorService } from '../../supervisor/src/SupervisorService';
-import { loadProfiles, type CharacterProfile } from '../../agent/src/profile';
+import { SupervisorMemory, SUPERVISOR_OWNER } from '../../supervisor/src/SupervisorMemory';
+import { loadProfiles, defaultProfile, type CharacterProfile } from '../../agent/src/profile';
 import { loadWorldBible } from '../../agent/src/worldBible';
 import { HttpLLMClient } from '../../agent/src/llm/HttpLLMClient';
 import { LlmEngineMonitor } from './LlmEngineMonitor';
 import { QdrantMemoryStore } from '../../agent/src/memory/QdrantMemoryStore';
 
 const MONGO_URL = process.env.MONGO_URL ?? 'mongodb://localhost:27017/simvillage';
+
+/** Clamp the master time-scale to a sane range, falling back to 1 on a bad value. */
+function clampSpeed(v: number): number {
+  return Number.isFinite(v) && v > 0 ? Math.max(0.1, Math.min(20, v)) : 1;
+}
+// MASTER TIME-SCALE for the whole simulation. SIM_SPEED > 1 runs EVERYTHING faster in
+// lock-step — bodies move quicker (more physics ticks/sec), the in-world clock and so
+// the needs/economy/weather advance sooner, and minds think more often — without
+// changing the world's internal proportions (a raider still crosses the map in the
+// same number of in-world seconds, needs still drift the same per in-world day). 1 =
+// normal; 2 = twice as fast; 0.5 = half speed. Clamped to [0.1, 20].
+const SIM_SPEED = clampSpeed(Number(process.env.SIM_SPEED ?? 1));
+
 // How often to persist a world snapshot (wall-clock). The emitted tick is now the
 // in-world clock (a round counter that holds during LLM waits), so snapshotting is
 // paced by real time rather than a tick count.
@@ -87,21 +107,34 @@ const SNAPSHOT_INTERVAL_MS = Number(process.env.SNAPSHOT_INTERVAL_MS ?? 15_000);
 // The physics loop runs several times a second so bodies move smoothly; minds
 // think far less often (paced by the scheduler), and a villager still covers a
 // meaningful distance between thoughts so neighbours stay near long enough to
-// interact. Tune via WORLD_TICK_RATE (ticks/second).
-const WORLD_TICK_RATE = Number(process.env.WORLD_TICK_RATE ?? 3);
+// interact. Tune via WORLD_TICK_RATE (ticks/second); scaled by SIM_SPEED so the
+// physics keep pace with the in-world clock when the whole sim is sped up.
+const WORLD_TICK_RATE = Number(process.env.WORLD_TICK_RATE ?? 3) * SIM_SPEED;
 const GATEWAY_WS_PORT = Number(process.env.GATEWAY_WS_PORT ?? 8080);
 
-const THINK_INTERVAL_MS = Number(process.env.VILLAGER_THINK_INTERVAL_MS ?? 12000);
+const THINK_INTERVAL_MS = Number(process.env.VILLAGER_THINK_INTERVAL_MS ?? 12000) / SIM_SPEED;
 // The in-world clock now advances on WALL TIME, not per LLM round, so time flows
 // steadily no matter how many (or few) minds are thinking. One in-world tick
 // (SIM_SECONDS_PER_TICK simulated seconds) elapses every this-many real ms;
-// the 5s default keeps the same time-rate the old per-round clock had.
-const SIM_TICK_REAL_MS = Number(process.env.SIM_TICK_REAL_MS ?? 5_000);
+// the 5s default keeps the same time-rate the old per-round clock had. Divided by
+// SIM_SPEED so a sped-up sim reaches each in-world round proportionally sooner.
+const SIM_TICK_REAL_MS = Number(process.env.SIM_TICK_REAL_MS ?? 5_000) / SIM_SPEED;
 // A mind with nothing happening still thinks at least this often (the scheduler's
-// idle heartbeat); stimuli interrupt sooner. Tune via VILLAGER_HEARTBEAT_MS.
-const VILLAGER_HEARTBEAT_MS = Number(process.env.VILLAGER_HEARTBEAT_MS ?? 30_000);
+// idle heartbeat); stimuli interrupt sooner. Tune via VILLAGER_HEARTBEAT_MS; scaled
+// down by SIM_SPEED so minds keep up with a faster-moving world.
+const VILLAGER_HEARTBEAT_MS = Number(process.env.VILLAGER_HEARTBEAT_MS ?? 30_000) / SIM_SPEED;
 const MEMORY_ENABLED = ['1', 'true', 'yes', 'on'].includes(
   (process.env.VILLAGER_MEMORY ?? '').trim().toLowerCase(),
+);
+// v3 — which BRAIN drives the villagers. `utility` swaps every villager onto the
+// cheap rule-driven UtilityBrain (no LLM calls); anything else keeps the v2 LLM
+// minds. The whole village runs in either mode (design §11, P1).
+const VILLAGER_BRAIN: 'llm' | 'utility' =
+  (process.env.VILLAGER_BRAIN ?? '').trim().toLowerCase() === 'utility' ? 'utility' : 'llm';
+// v3 P5 (design §10) — start a TWO-village world: a home settlement + a rival, each its
+// own god, for soft competition (raids). A dev/demo flag; only acts on a FRESH world.
+const RIVAL_VILLAGE = ['1', 'true', 'yes', 'on'].includes(
+  (process.env.RIVAL_VILLAGE ?? '').trim().toLowerCase(),
 );
 const SUPERVISOR_CHARTER = process.env.SUPERVISOR_CHARTER;
 const SUPERVISOR_MIN_DAYS = Number(process.env.SUPERVISOR_MIN_DAYS_BETWEEN_ACTS ?? 1);
@@ -135,6 +168,17 @@ interface GeneratedWorldState {
   bible: string;
   theme: string;
   setting: string;
+  /**
+   * Per-village bibles, keyed by villageId, for an LLM-generated TWO-village (rival)
+   * world where each side is themed independently. Absent for a one-village world
+   * (every mind shares the single `bible` above).
+   */
+  bibleByVillage?: Record<string, string>;
+  /**
+   * Each village's chosen RAID STANCE (competition intensity), keyed by villageId, so
+   * a reboot re-applies it to that side's god. Absent for a one-village world.
+   */
+  intensityByVillage?: Record<string, CompetitionIntensity>;
 }
 
 async function main(): Promise<void> {
@@ -286,6 +330,7 @@ async function main(): Promise<void> {
         maxVillagers: MAX_GENERATE_VILLAGERS,
         defaultVillagers: DEFAULT_GENERATE_VILLAGERS,
         defaultSize: 'medium' as VillageSize,
+        rival: RIVAL_VILLAGE,
       }),
     );
   };
@@ -326,6 +371,10 @@ async function main(): Promise<void> {
     bible: string;
     theme?: string;
     setting?: string;
+    /** Per-village bibles (LLM rival world); absent for a one-village world. */
+    bibleByVillage?: Record<string, string>;
+    /** Per-village raid stance (rival world); absent for a one-village world. */
+    intensityByVillage?: Record<string, CompetitionIntensity>;
   };
 
   /**
@@ -349,6 +398,8 @@ async function main(): Promise<void> {
           seed: existing!,
           profiles: saved.profiles,
           bible: saved.bible ?? '',
+          ...(saved.bibleByVillage ? { bibleByVillage: saved.bibleByVillage } : {}),
+          ...(saved.intensityByVillage ? { intensityByVillage: saved.intensityByVillage } : {}),
           ...(existing!.theme ? { theme: existing!.theme } : {}),
           ...(existing!.setting ? { setting: existing!.setting } : {}),
         };
@@ -361,6 +412,17 @@ async function main(): Promise<void> {
       if (rosterMatches) return resumeClassic(existing!);
       console.warn('[boot] persisted world is incompatible with the current roster; starting fresh');
       // fall through to fresh setup
+    }
+
+    // 1b. No usable world + the rival flag: seed a TWO-village world (home + rival), each
+    //     with its own roster + god, for v3 soft competition. Unlike the single-village
+    //     path it ALWAYS asks the browser (the rival setup screen), so the player can pick
+    //     a shared map theme plus independent per-side style/count/size/raid-stance.
+    if (RIVAL_VILLAGE) {
+      console.log('[boot] RIVAL_VILLAGE set — awaiting the rival setup choice from the browser');
+      publishNeedsSetup();
+      const choice = await awaitSetupChoice();
+      return generateRivalFresh(choice);
     }
 
     // 2. No usable world + headless flag: auto-generate without a browser (dev/CI).
@@ -436,6 +498,152 @@ async function main(): Promise<void> {
   ): { seed: typeof existing; profiles: CharacterProfile[]; bible: string } {
     console.log('[boot] resumed world from Mongo');
     return { seed: existing, profiles: loadProfiles(), bible: loadWorldBible() };
+  }
+
+  /**
+   * Seed a fresh TWO-village world (v3 P5). With the LLM generator on (GENERATE_LLM,
+   * the default) each side is GENERATED — its own themed map, roster and bible — and
+   * the rival is themed as the home's contrasting neighbour. Falls back to the
+   * fixed-blueprint rival villages if generation fails (so the demo always comes up).
+   */
+  /** Clamp a chosen villager count into [1, MAX_GENERATE_VILLAGERS]. */
+  function clampVillagers(n: number): number {
+    return Math.max(1, Math.min(MAX_GENERATE_VILLAGERS, Math.round(n)));
+  }
+
+  /** The per-village raid stances from the setup choice, defaulting to balanced. */
+  function rivalIntensities(rival: RivalSetupParams | undefined): Record<string, CompetitionIntensity> {
+    return {
+      [DEFAULT_VILLAGE_ID]: rival?.home.intensity ?? DEFAULT_COMPETITION_INTENSITY,
+      [RIVAL_VILLAGE_ID]: rival?.rival.intensity ?? DEFAULT_COMPETITION_INTENSITY,
+    };
+  }
+
+  async function generateRivalFresh(choice: UserGenerateWorldPayload): Promise<ResolvedWorld> {
+    const rival = choice.rival;
+    if (choice.mode !== 'static' && GENERATE_LLM) {
+      try {
+        return await generateRivalWithLLM(rival);
+      } catch (err) {
+        console.error(
+          `[boot] LLM rival generation failed (${err instanceof Error ? err.message : String(err)}); ` +
+            'falling back to the fixed-blueprint rival villages',
+        );
+      }
+    }
+    console.log('[boot] setup: classic (fixed-blueprint) rival villages chosen');
+    return generateRivalClassic(rival);
+  }
+
+  /**
+   * Generate BOTH villages with the LLM, persist the combined roster + per-village
+   * bibles, and stream progress to the overlay. Headless (env-driven), like the
+   * single-village auto path — the rival flag precedes the setup screen.
+   */
+  async function generateRivalWithLLM(rival: RivalSetupParams | undefined): Promise<ResolvedWorld> {
+    const homeParams = rival?.home ?? {};
+    const rivalParams = rival?.rival ?? {};
+    const generated = await generateRivalWorldWithLLM(
+      genLlm,
+      (i) => `villager_${i + 1}`,
+      (i) => `rival_${i + 1}`,
+      {
+        mapTheme: (rival?.mapTheme ?? GENERATE_THEME).trim(),
+        maxVillagers: MAX_GENERATE_VILLAGERS,
+        retries: GENERATE_RETRIES,
+        onProgress: (s) => publishGenerating(s),
+        home: {
+          ...(homeParams.style ? { style: homeParams.style } : {}),
+          villagers: homeParams.villagers ?? DEFAULT_GENERATE_VILLAGERS,
+          size: homeParams.size ?? 'medium',
+        },
+        rival: {
+          ...(rivalParams.style ? { style: rivalParams.style } : {}),
+          villagers: rivalParams.villagers ?? DEFAULT_GENERATE_VILLAGERS,
+          size: rivalParams.size ?? 'medium',
+        },
+      },
+    );
+    publishGenerating({ phase: 'assembling', label: 'The two villages are ready', done: true });
+    await store.saveSeed(generated.seed);
+    const profiles = [...generated.home.profiles, ...generated.rival.profiles];
+    const bibleByVillage: Record<string, string> = {
+      [DEFAULT_VILLAGE_ID]: generated.home.bible,
+      [RIVAL_VILLAGE_ID]: generated.rival.bible,
+    };
+    await runtimeState.set<GeneratedWorldState>(GENERATED_WORLD_KEY, {
+      profiles,
+      bible: generated.home.bible,
+      bibleByVillage,
+      theme: generated.home.theme,
+      setting: generated.home.setting,
+      intensityByVillage: rivalIntensities(rival),
+    });
+    console.log(
+      `[boot] generated two LLM villages: "${generated.home.theme}" (home, ${generated.home.profiles.length}) ` +
+        `vs "${generated.rival.theme}" (rival, ${generated.rival.profiles.length}); ${generated.seed.buildings.length} buildings`,
+    );
+    return {
+      seed: generated.seed,
+      profiles,
+      bible: generated.home.bible,
+      bibleByVillage,
+      intensityByVillage: rivalIntensities(rival),
+      theme: generated.home.theme,
+      setting: generated.home.setting,
+    };
+  }
+
+  /**
+   * Seed a fresh TWO-village world from the FIXED blueprint (the fallback when the LLM
+   * generator is off or fails). The home village reuses the file roster (stamped
+   * village_0); the rival gets a deterministic roster of the same size (stamped
+   * village_1). Both rosters + the shared bible are persisted under the generated-world
+   * key so a reboot RESUMES the two villages (the file roster alone wouldn't match the
+   * doubled-up world).
+   */
+  async function generateRivalClassic(rival: RivalSetupParams | undefined): Promise<ResolvedWorld> {
+    // Honour the per-side villager counts from the setup screen (classic ignores the
+    // styles/sizes/stances). Clamp to the ceiling; default to the file roster's size.
+    const fileRoster = loadProfiles();
+    const homeCount = clampVillagers(rival?.home.villagers ?? fileRoster.length);
+    const rivalCount = clampVillagers(rival?.rival.villagers ?? fileRoster.length);
+
+    // Home keeps the hand-authored personas, trimmed or padded to the chosen count.
+    const homeProfiles: CharacterProfile[] = Array.from({ length: homeCount }, (_, i) => {
+      const id = `villager_${i + 1}`;
+      const base = fileRoster[i] ?? defaultProfile(id);
+      return { ...base, id, villageId: DEFAULT_VILLAGE_ID };
+    });
+    // A rival roster of the chosen size — deterministic ids/personas, no LLM needed.
+    const rivalTraits = ['proud', 'industrious', 'wary'];
+    const rivalProfiles: CharacterProfile[] = Array.from({ length: rivalCount }, (_, i) => ({
+      ...defaultProfile(`rival_${i + 1}`),
+      name: `Rival ${i + 1}`,
+      traits: rivalTraits,
+      goal: 'Make your village outgrow the rivals across the valley.',
+      villageId: RIVAL_VILLAGE_ID,
+    }));
+    const seed = generateRivalSeed(
+      homeProfiles.map((p) => p.id),
+      rivalProfiles.map((p) => p.id),
+    );
+    const profiles = [...homeProfiles, ...rivalProfiles];
+    const bible = loadWorldBible();
+    await store.saveSeed(seed);
+    // Persist the combined roster so the resume path (step 1) rebuilds both villages.
+    await runtimeState.set<GeneratedWorldState>(GENERATED_WORLD_KEY, {
+      profiles,
+      bible,
+      theme: 'Two Villages',
+      setting: 'A home settlement and a rival share one valley, each with its own god.',
+      intensityByVillage: rivalIntensities(rival),
+    });
+    console.log(
+      `[boot] seeded two villages: ${homeProfiles.length} home + ${rivalProfiles.length} rival ` +
+        `villagers, ${seed.buildings.length} buildings`,
+    );
+    return { seed, profiles, bible, intensityByVillage: rivalIntensities(rival) };
   }
 
   /** Seed a fresh classic village (hand-authored layout + file personas/bible). */
@@ -596,6 +804,13 @@ async function main(): Promise<void> {
   //     or the LLM-generated themed bible) and handed to every mind, so the long
   //     common prompt prefix is identical across villagers (cache-friendly).
   const bible = world.bible;
+  // For an LLM-generated TWO-village world each side has its OWN themed bible; resolve
+  // per villager by its villageId, falling back to the shared bible. One-village worlds
+  // hand the single string to every mind unchanged.
+  const bibleByVillage = world.bibleByVillage;
+  const bibleFor: string | ((villageId: string | undefined) => string) = bibleByVillage
+    ? (villageId: string | undefined) => bibleByVillage[villageId ?? DEFAULT_VILLAGE_ID] ?? bible
+    : bible;
   const store4mem = MEMORY_ENABLED ? new QdrantMemoryStore({ dimensions: llm.dimensions }) : null;
   // Hand the live store to the gateway's `/memories` reader, declared up top.
   memoryRef.store = store4mem;
@@ -616,15 +831,30 @@ async function main(): Promise<void> {
   // 4e-ter. The registry gives every body a brain — the seeded personas now, and
   //   any villager spawned later (a God-made "Newcomer" comes alive on its own).
   const registry = new MindRegistry(bus, llm, scheduler, {
-    bible,
+    bible: bibleFor,
     memoryStore: store4mem,
     runtimeState,
     storedBooks,
     profilesById: new Map(profiles.map((p) => [p.id, p])),
     thinkIntervalMs: THINK_INTERVAL_MS,
+    villagerBrain: VILLAGER_BRAIN,
   });
+  console.log(
+    `[server] villager brain: ${VILLAGER_BRAIN}` +
+      (VILLAGER_BRAIN === 'utility' ? ' (v3 rule-driven — no villager LLM calls)' : ' (per-villager LLM)'),
+  );
   await registry.start(villagerIds);
   await scheduler.start();
+
+  // 4e-quinquies. v3 P4 — the rare villager-LLM MOMENT budget (design §7). Only meaningful
+  //   under the utility brain (LLM minds already speak for themselves and ignore moments):
+  //   it hands a single real LLM turn to one villager on a notable beat (a crisis, the god's
+  //   whisper), then they drop back to the cheap brain. Started AFTER the minds subscribe to
+  //   `village.moment`, so a moment is never published before a villager can hear it.
+  if (VILLAGER_BRAIN === 'utility') {
+    const moments = new MomentCoordinator(bus);
+    await moments.start();
+  }
 
   // 4e-quater. The in-world CLOCK on WALL TIME: one tick every SIM_TICK_REAL_MS,
   //   resumed from the last snapshot, so simulated time flows steadily regardless of
@@ -643,16 +873,45 @@ async function main(): Promise<void> {
   });
   await conversationTracker.start();
 
-  // 4f. The God Agent.
-  const supervisor = new SupervisorService(bus, llm, {
-    ...(SUPERVISOR_CHARTER ? { charter: SUPERVISOR_CHARTER } : {}),
-    minDaysBetweenActs: SUPERVISOR_MIN_DAYS,
-    // Remember the god's cooldown + pending prayers across a restart.
-    state: runtimeState,
-    // The free-text seam the god uses to author the nightly chronicle.
-    chronicler: llm,
-  });
-  await supervisor.start();
+  // 4f. The God Agent. v3 P4 — when long-term memory is enabled, the god gets a
+  //   hippocampus of its own: the SAME Qdrant store the villagers use (memories
+  //   isolate by owner id, so the god's strategy lives under a synthetic owner that
+  //   can't collide with a villager). The LLM client doubles as the embedder and the
+  //   synthesizer for the nightly strategy. Under the utility brain the villagers no
+  //   longer recall from this store, so the memory has, in effect, moved UP to the god.
+  //   v3 P5 (design §10) — one god PER village. The seam is keyed off entity villageIds:
+  //   gather the distinct villages present in the world and bring up a SupervisorService for
+  //   each, every god scoped (state / durable queue / steer broadcasts) to its own village and
+  //   given its own namespaced long-term memory so two gods never recall each other's strategy.
+  //   With a single village this is exactly one god — unchanged behaviour.
+  const villageIds = [...new Set(seed.villagers.map((v) => v.villageId ?? DEFAULT_VILLAGE_ID))];
+  const supervisors: SupervisorService[] = [];
+  for (const villageId of villageIds) {
+    const supervisorMemory = store4mem
+      ? new SupervisorMemory(llm, store4mem, llm, {
+          // The home village keeps the original owner id (back-compat); a rival is namespaced.
+          ...(villageId === DEFAULT_VILLAGE_ID ? {} : { ownerId: `${SUPERVISOR_OWNER}:${villageId}` }),
+        })
+      : undefined;
+    // The raid stance chosen at setup for this side (rival worlds only); shapes how
+    // readily this god raids. Only meaningful with a rival present.
+    const competitionIntensity = world.intensityByVillage?.[villageId];
+    const supervisor = new SupervisorService(bus, llm, {
+      villageId,
+      ...(SUPERVISOR_CHARTER ? { charter: SUPERVISOR_CHARTER } : {}),
+      ...(competitionIntensity ? { competitionIntensity } : {}),
+      minDaysBetweenActs: SUPERVISOR_MIN_DAYS,
+      // Remember the god's cooldown + pending prayers across a restart.
+      state: runtimeState,
+      // The free-text seam the god uses to author the nightly chronicle.
+      chronicler: llm,
+      // The god's long-term memory of past days + the strategy distilled from them.
+      ...(supervisorMemory ? { memory: supervisorMemory } : {}),
+    });
+    await supervisor.start();
+    supervisors.push(supervisor);
+  }
+  console.log(`[boot] ${supervisors.length} supervisor(s) online for village(s): ${villageIds.join(', ')}`);
 
   // 5. Snapshot persistence on a wall-clock interval. Fire-and-forget so a slow disk
   //    never stalls the simulation loop.
@@ -664,7 +923,11 @@ async function main(): Promise<void> {
 
   // 6. Run.
   engine.start();
-  console.log(`[boot] backend running at ${engine.tickRate} ticks/s; WS on :${GATEWAY_WS_PORT}`);
+  console.log(
+    `[boot] backend running at ${engine.tickRate} ticks/s` +
+      (SIM_SPEED !== 1 ? ` (SIM_SPEED ${SIM_SPEED}×; round every ${Math.round(SIM_TICK_REAL_MS)}ms)` : '') +
+      `; WS on :${GATEWAY_WS_PORT}`,
+  );
 
   // Graceful shutdown: stop the loop, close sockets, flush a final snapshot.
   const shutdown = async (signal: string): Promise<void> => {

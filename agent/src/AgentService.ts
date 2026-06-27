@@ -28,6 +28,9 @@ import type {
   VillagerSpeakEvent,
   PlantIdeaPayload,
   SupervisorPlantIdeaEvent,
+  SupervisorSetPrioritiesEvent,
+  SupervisorIssueOrderEvent,
+  VillageMomentEvent,
   UserPlantIdeaEvent,
   SimTurnGrantedEvent,
   VillagerGroupPlanEvent,
@@ -36,7 +39,8 @@ import type {
   VillageVisionEvent,
   WorldEvent,
 } from '../../shared/events';
-import type { AgendaEvent, AgendaItem, AgendaNote, AgentTraceStep, BuildingEvent, GroupPlan, LlmMessage, LlmRouteHint, Relationship, VillageVision } from '../../shared/types';
+import type { AgendaEvent, AgendaItem, AgendaNote, AgentTraceStep, BuildingEvent, GroupPlan, LlmMessage, LlmRouteHint, Relationship, VillageVision, VillagePolicy, VillageOrder } from '../../shared/types';
+import { DEFAULT_VILLAGE_ID } from '../../shared/types';
 import { BUILDING_LOG_WINDOW_TICKS, SERVICE_REACH, buildableFor } from '../../shared/buildings';
 import type { CharacterProfile } from './profile';
 import { WorldView, type Perception } from './sensory';
@@ -61,6 +65,8 @@ import type { KnownPerson, MemoryStream } from './memory/MemoryStream';
 import type { RecalledMemory } from './memory/MemoryStore';
 import { ReflectionLoop } from './memory/ReflectionLoop';
 import { RelationshipBook } from './social/RelationshipBook';
+import { UtilityBrain } from './brain/UtilityBrain';
+import { TemplatedSpeech } from './brain/TemplatedSpeech';
 import {
   narrateHeardSpeech,
   narrateImplant,
@@ -91,6 +97,15 @@ const MIND_MAX_STEPS = clampInt(process.env.MIND_MAX_STEPS, 8, 1, 40);
  * physical action that follows (default 2).
  */
 const MIND_MAX_SOFT = clampInt(process.env.MIND_MAX_SOFT, 2, 0, 20);
+
+/**
+ * v3 P4 — how much a single utility turn warms a tie by proximity. Tiny on purpose:
+ * affinity ranges over ±100, so at these rates a lasting bond (~+25) is dozens of turns
+ * of shared company, not a chance meeting. A gathering (working/idling together) warms
+ * faster than merely passing within earshot.
+ */
+const SOCIAL_GATHER_NUDGE = 0.5;
+const SOCIAL_EARSHOT_NUDGE = 0.15;
 
 /** Parse a positive integer env value within [min,max], falling back to `def`. */
 function clampInt(raw: string | undefined, def: number, min: number, max: number): number {
@@ -163,6 +178,15 @@ export interface AgentServiceOptions {
    * persist the watermark for the next restart.
    */
   onReflectedDay?: (day: number) => void;
+  /**
+   * v3 — which BRAIN drives this villager. `'llm'` (default) runs the per-villager
+   * language model through the agentic loop, exactly as v2 did. `'utility'` swaps in
+   * the cheap, rule-driven {@link UtilityBrain}: the mind still senses, remembers and
+   * is scheduled the same way, but each turn it SCORES candidate actions and picks the
+   * best with no LLM call. Set via `VILLAGER_BRAIN`. Keeps the village runnable in both
+   * modes (design §11, P1).
+   */
+  villagerBrain?: 'llm' | 'utility';
 }
 
 export class AgentService {
@@ -249,6 +273,60 @@ export class AgentService {
   private readonly coordinated: boolean;
   /** Pool routing for this mind's LLM calls (endpoint/model), or undefined for "any free endpoint". */
   private readonly route: LlmRouteHint | undefined;
+  /**
+   * The v3 rule-driven utility brain, or null when this villager thinks with the LLM.
+   * When present, {@link think} chooses with it instead of running the agentic loop —
+   * no language-model call. Holds a little hysteresis state, so it is per-villager.
+   */
+  private readonly brain: UtilityBrain | null;
+  /**
+   * v3 P4 — the utility villager's VOICE, or null when it thinks with the LLM (which
+   * speaks for itself). After the brain chooses, this picks an occasional state-derived
+   * line ("I'm parched", "Back to the fields", a greeting) so the LLM-free village isn't
+   * mute. It enforces strict proximity + a cooldown internally, so the village still
+   * feels alive at zero language-model cost. Per-villager (it holds greeting/cooldown state).
+   */
+  private readonly speech: TemplatedSpeech | null;
+  /**
+   * The supervisor's standing POLICY (priority weights), or null until the god first
+   * broadcasts one. The utility brain folds it into its scores so the village visibly
+   * steers; the LLM brain ignores it. Updated off `supervisor.set_priorities` (P2).
+   */
+  private policy: VillagePolicy | null = null;
+  /**
+   * The live supervisor ORDER aimed at this villager (P3), with the tick it arrived so its
+   * `ttlTicks` can be enforced locally. Null when none is in force; a newer order replaces
+   * an older one. Only the utility brain acts on it.
+   */
+  private order: { order: VillageOrder; receivedTick: number } | null = null;
+
+  /**
+   * v3 P5 (rival-village seam) — which village this villager belongs to, so it heeds only
+   * ITS OWN god's steer (policy / orders / vision) and ignores the rival's. Seeded from the
+   * profile and kept current from each perception. Defaults to {@link DEFAULT_VILLAGE_ID}, so
+   * a single-village world (where every broadcast is tagged the same) is unchanged.
+   */
+  private myVillageId: string = DEFAULT_VILLAGE_ID;
+
+  /**
+   * v3 P4 (design §7) — a pending rare-LLM "MOMENT" for this (utility-brained) villager,
+   * or null. When set, the next think runs ONE real language-model turn instead of the
+   * cheap brain, with this reason folded into the prompt so the turn reacts to the
+   * occasion (a famine, the god's whisper) — then the villager drops back to the brain.
+   * Granted by the {@link MomentCoordinator} over `village.moment`. Ignored by LLM minds.
+   */
+  private momentReason: string | null = null;
+
+  /**
+   * v3 P4 — wall-clock ms of the last time we streamed this villager's (utility-nudged)
+   * social book, and whether it has drifted since. Proximity nudges are tiny and happen
+   * every turn, so we coalesce them and publish the book at most once per
+   * {@link SOCIAL_PUBLISH_MS} rather than on every micro-change.
+   */
+  private socialDirty = false;
+  private lastSocialPublishAt = 0;
+  /** Don't stream the nudged social book more often than this (ms). */
+  private static readonly SOCIAL_PUBLISH_MS = 20_000;
 
   /**
    * What happened AROUND this villager since its last thought, accumulated across
@@ -319,9 +397,12 @@ export class AgentService {
     options: AgentServiceOptions = {},
   ) {
     this.world = new WorldView(profile.id);
+    this.myVillageId = profile.villageId ?? DEFAULT_VILLAGE_ID;
     this.prompts = new PromptAssembler(profile, options.bible ?? '');
     this.coordinated = options.coordinated ?? false;
     this.route = options.route;
+    this.brain = options.villagerBrain === 'utility' ? new UtilityBrain() : null;
+    this.speech = options.villagerBrain === 'utility' ? new TemplatedSpeech() : null;
     this.thinkIntervalMs = options.thinkIntervalMs ?? 4000;
     // Keep heard speech alive for several think-cycles so a reply is still in the
     // buffer when this mind next gets to act (floor of 60s for slow cadences).
@@ -439,6 +520,7 @@ export class AgentService {
       EXCHANGES.villageEvents,
       'village.vision',
       (event) => {
+        if (!this.ownVillage(event.payload.villageId)) return; // only our own god's vision
         this.villageVision = event.payload;
       },
     );
@@ -448,6 +530,53 @@ export class AgentService {
     if (this.coordinated) {
       await this.bus.subscribe<SimTurnGrantedEvent>(EXCHANGES.simulation, 'sim.turn_granted', (event) =>
         this.onTurnGranted(event.payload),
+      );
+    }
+
+    // v3 — a utility-brained villager follows the supervisor's standing POLICY. Subscribe to
+    // the god's `set_priorities` broadcasts and hold the latest weights for the brain to read.
+    // Only the utility brain consults policy, so the LLM minds need not listen.
+    if (this.brain) {
+      await this.bus.subscribe<SupervisorSetPrioritiesEvent>(
+        EXCHANGES.supervisorCommands,
+        'supervisor.set_priorities',
+        (event) => {
+          if (!this.ownVillage(event.payload.villageId)) return; // only our own god steers us
+          this.policy = event.payload;
+          console.log(
+            `[villager:${this.profile.id}] policy updated: ` +
+              Object.entries(event.payload.weights)
+                .map(([p, w]) => `${p}=${w}`)
+                .join(', '),
+          );
+        },
+      );
+
+      // Targeted ORDERS. Keep one only if it is aimed at us; stamp the arrival tick so the
+      // TTL is enforced from when WE received it (no reliance on the supervisor's clock).
+      await this.bus.subscribe<SupervisorIssueOrderEvent>(
+        EXCHANGES.supervisorCommands,
+        'supervisor.issue_order',
+        (event) => {
+          if (!this.ownVillage(event.payload.villageId)) return; // not our god's order
+          if (!this.orderTargetsMe(event.payload)) return;
+          this.order = { order: event.payload, receivedTick: this.latest?.tick ?? 0 };
+          console.log(`[villager:${this.profile.id}] received order: ${event.payload.task} (${event.payload.rationale ?? 'no reason given'})`);
+        },
+      );
+
+      // v3 P4 (design §7) — a rare LLM MOMENT granted to this villager. Hold the reason and
+      // ask for a turn now; the next think runs one real language-model turn (then we drop
+      // back to the brain). Only the utility brain takes moments — an LLM mind already speaks.
+      await this.bus.subscribe<VillageMomentEvent>(
+        EXCHANGES.villageEvents,
+        'village.moment',
+        (event) => {
+          if (event.payload.villagerId !== this.profile.id) return;
+          this.momentReason = event.payload.reason;
+          console.log(`[villager:${this.profile.id}] granted a rare LLM moment (${event.payload.kind})`);
+          this.requestTurn(0.97, 'a moment of significance');
+        },
       );
     }
 
@@ -495,6 +624,8 @@ export class AgentService {
         if (!perception) return; // our body isn't in the world (yet)
         const prev = this.latest;
         this.latest = perception;
+        // Keep our village allegiance current from the body we inhabit (v3 rival seam).
+        this.myVillageId = perception.self.villageId;
         // Fold what changed around us since the previous tick into the inter-think
         // log + an urgency signal, so a reactive mind notices encounters/arrivals/
         // needs it would miss by only seeing a snapshot when it finally thinks.
@@ -931,6 +1062,19 @@ export class AgentService {
     const perception = this.latest;
     if (!perception) return;
 
+    // v3 — the rule-driven path. When a utility brain is configured this villager
+    // never calls the LLM: it scores candidate actions and commits the best, then
+    // broadcasts the same telemetry envelope so the inspector still shows its choice.
+    // EXCEPTION (design §7): a granted rare MOMENT makes this one turn run the real
+    // LLM path below, so the villager can speak/act for a memorable beat; we consume
+    // the reason here and fold it into the prompt further down.
+    const moment = this.momentReason;
+    this.momentReason = null;
+    if (this.brain && !moment) {
+      this.thinkUtility(perception);
+      return;
+    }
+
     this.thinking = true;
     this.lastThoughtAt = Date.now();
 
@@ -987,7 +1131,9 @@ export class AgentService {
       agendaEvents: this.myEvents(),
       agendaInvited: this.myInvitedEvents(),
       villageVision: this.villageVision,
-      recentEvents: [...this.sinceLastThink],
+      // Lead the inter-think recap with the MOMENT (when one was granted), so the turn's
+      // single real thought is anchored on the occasion that earned it.
+      recentEvents: moment ? [`A moment of significance — ${moment}`, ...this.sinceLastThink] : [...this.sinceLastThink],
     });
     // The inter-think log has now been folded into this prompt; start a fresh recap
     // for whatever happens before the next thought.
@@ -1007,6 +1153,132 @@ export class AgentService {
     // telemetry must never stall the think loop.
     this.publishTelemetry(perception, recalled, system, userMessage, rawOutput, decision, steps);
     this.thinking = false;
+  }
+
+  /**
+   * v3 utility-AI turn (design §6). No LLM: the {@link UtilityBrain} reads this
+   * villager's perception, the known village layout and its traits, scores the
+   * handful of sensible actions, and returns the best — which we COMMIT through the
+   * very same effect layer the LLM path uses (so `move_to`/`work_at`/… resolve
+   * identically). We still publish a `thought_process` envelope, tagged `'utility'`,
+   * with the chooser's rationale as the "raw output" so the thought-inspector keeps
+   * working. The supervisor POLICY (P2) and any live targeted ORDER (P3) are folded in
+   * here too, so the village visibly steers under the god's standing weights and pushes.
+   */
+  private thinkUtility(perception: Perception): void {
+    this.lastThoughtAt = Date.now();
+    const order = this.liveOrder(perception.tick);
+    const choice = this.brain!.decide({
+      perception,
+      villageMap: this.world.villageMap(),
+      traits: this.profile.traits,
+      housingNeeded: this.world.housingNeeded(),
+      ...(this.policy ? { policy: this.policy } : {}),
+      ...(order ? { order } : {}),
+      ...(this.relationships ? { affinityOf: (id) => this.relationships!.get(id)?.affinity } : {}),
+    });
+    if (choice) this.commit(choice.decision);
+
+    // v3 P4 — give the LLM-free villager a VOICE. The chooser returns a line only when
+    // someone is within earshot and its cooldown has elapsed (strict proximity + sparse
+    // pacing handled inside), so this is a side-channel to the action — the villager
+    // works AND occasionally says a word — never a model call.
+    const line = this.speech?.decide({
+      perception,
+      traits: this.profile.traits,
+      choice,
+      affinityOf: (id) => this.relationships?.get(id)?.affinity,
+      nowMs: Date.now(),
+    });
+    if (line) this.speakAloud(line);
+
+    // v3 P4 — cheap numeric social dynamics: warm ties to the company we keep. Without
+    // the nightly reflection (which the utility brain skips) affinities would never
+    // move, so do it here from proximity — time among companions is a bond formed, time
+    // near a passer-by a smaller acquaintance. Coalesced + streamed on a throttle.
+    this.nudgeSocial(perception);
+
+    // Surface the chooser's reasoning as the raw output; no recall/system prompt/steps
+    // are involved in a rule-driven turn.
+    this.publishTelemetry(
+      perception,
+      [],
+      '',
+      choice?.why ?? 'nothing pressing — standing by',
+      choice?.why ?? '',
+      choice?.decision ?? null,
+      [],
+      'utility',
+    );
+  }
+
+  /**
+   * v3 P4 — fold this turn's proximity into the social book (utility brain only). Standing
+   * in a shared GATHERING warms a tie a little; merely having someone in EARSHOT a touch
+   * less. The nudges are tiny so a bond is the fruit of sustained company, not one chance
+   * crossing; they never touch the written opinion (that stays the reflection's job). The
+   * book is streamed for persistence + the UI on a throttle, since these accrue every turn.
+   */
+  private nudgeSocial(perception: Perception): void {
+    const book = this.relationships;
+    if (!book) return;
+    const tick = perception.tick;
+    const companions = new Set(perception.self.gathering?.withIds ?? []);
+    for (const v of perception.nearbyVillagers) {
+      if (!v.canHear && !v.canSee) continue;
+      // A companion in the same gathering bonds faster than a mere passer-by in range.
+      const delta = companions.has(v.id) ? SOCIAL_GATHER_NUDGE : v.canHear ? SOCIAL_EARSHOT_NUDGE : 0;
+      if (delta === 0) continue;
+      if (book.nudge(v.id, v.name, delta, tick)) this.socialDirty = true;
+    }
+    if (!this.socialDirty) return;
+    const now = Date.now();
+    if (now - this.lastSocialPublishAt < AgentService.SOCIAL_PUBLISH_MS) return;
+    this.lastSocialPublishAt = now;
+    this.socialDirty = false;
+    this.publishRelationships(book.all());
+  }
+
+  /**
+   * Whether a village-tagged broadcast (policy / order / vision) is from THIS villager's own
+   * god. An untagged broadcast (no villageId) is treated as the {@link DEFAULT_VILLAGE_ID}, so
+   * a single-village world — where every broadcast carries the one id — accepts everything.
+   */
+  private ownVillage(villageId?: string): boolean {
+    return (villageId ?? DEFAULT_VILLAGE_ID) === this.myVillageId;
+  }
+
+  /**
+   * Is this villager a target of `order`? An order with explicit `villagerIds` hits only
+   * those; one with a `role` hits anyone whose traits carry that keyword; one with neither
+   * is village-wide. (`count` is advisory and not enforced here.)
+   */
+  private orderTargetsMe(order: VillageOrder): boolean {
+    const t = order.target ?? {};
+    const hasIds = (t.villagerIds?.length ?? 0) > 0;
+    const hasRole = !!t.role;
+    if (!hasIds && !hasRole) return true; // the whole village
+    if (hasIds && t.villagerIds!.includes(this.profile.id)) return true;
+    if (hasRole) {
+      const role = t.role!.toLowerCase();
+      if (this.profile.traits.some((tr) => tr.toLowerCase().includes(role))) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The order to obey THIS turn, or null. Drops a held order once it has outlived its
+   * `ttlTicks` (measured from when we received it), so the villager relaxes back to policy.
+   */
+  private liveOrder(tick: number): { task: VillageOrder['task']; params: VillageOrder['params'] } | null {
+    if (!this.order) return null;
+    const { order, receivedTick } = this.order;
+    if (order.ttlTicks !== undefined && tick - receivedTick > order.ttlTicks) {
+      console.log(`[villager:${this.profile.id}] order expired (${order.task})`);
+      this.order = null;
+      return null;
+    }
+    return { task: order.task, params: order.params };
   }
 
   /**
@@ -1241,6 +1513,7 @@ export class AgentService {
     rawOutput: string,
     decision: AgentDecision | null,
     steps: AgentTraceStep[],
+    source: 'llm' | 'utility' = 'llm',
   ): void {
     this.bus.publish(
       EXCHANGES.villagerTelemetry,
@@ -1257,9 +1530,9 @@ export class AgentService {
         prompt: { system: this.provider.effectiveSystem?.(system, 'decide') ?? system, user },
         rawOutput,
         decision,
-        // Every acted decision is now the model's own (there is no scripted fallback);
-        // tagged 'llm' to keep the telemetry/action-log wire shape stable.
-        ...(decision ? { decisionSource: 'llm' as const } : {}),
+        // The source of the chosen action: the LLM (default) or the v3 utility brain.
+        // Either way it is the mind's own decision (there is no scripted fallback).
+        ...(decision ? { decisionSource: source } : {}),
         // The full agentic trace (lookups + actions + yield), for the inspector.
         ...(steps.length > 0 ? { steps } : {}),
       }),

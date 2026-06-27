@@ -16,8 +16,9 @@
 #                                                      +--> mongo + qdrant
 #
 # Network exposure:
-#   Only the `client` service publishes a host port (5173). Everything else lives
-#   on internal Docker networks the host cannot reach inbound:
+#   The `client` service publishes a host port for the browser, and `mongo`
+#   publishes 27017 (MONGO_HOST_PORT) for DB inspection/debugging. Everything else
+#   lives on internal Docker networks the host cannot reach inbound:
 #     core -> mongo, qdrant, embed, llm, backend  (the engine room)
 #     edge -> backend, client                     (the only path to the browser)
 #   The browser hits the client's own origin; nginx reverse-proxies the WebSocket
@@ -36,6 +37,13 @@ services:
     image: mongo:7
     restart: unless-stopped
     networks: [core]
+    # Publish Mongo to the host for inspection/debugging (e.g. `mongosh
+    # mongodb://localhost:27017/simvillage`). Override the host port with
+    # MONGO_HOST_PORT if 27017 is taken locally. NOTE: this opens the datastore to
+    # the host (and, on a non-loopback bind, the network) — keep it out of an
+    # untrusted-network deployment, or bind it to 127.0.0.1 only.
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -47,8 +55,23 @@ services:
   # Vector database for villager long-term memory (RAG). Used only when
   # VILLAGER_MEMORY=on on the backend. Rest API on :6333; gRPC on :6334.
   qdrant:
-    image: qdrant/qdrant:v1.13.6
+    # CUDA (NVIDIA GPU) build — GPU-accelerated HNSW index build. Needs the NVIDIA
+    # Container Toolkit on the host + the `deploy.resources` GPU reservation below.
+    image: qdrant/qdrant:v1.13.6-gpu-nvidia
+    # CPU-only build (no GPU required) — drop the GPU reservation + GPU__* env below:
+    # image: qdrant/qdrant:v1.13.6
     restart: unless-stopped
+    # Turn on GPU-accelerated indexing (only honoured by the -gpu-nvidia image).
+    environment:
+      QDRANT__GPU__INDEXING: "true"
+    # Reserve an NVIDIA GPU for the container (requires the NVIDIA Container Toolkit).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     # Qdrant's RocksDB keeps many segment files open; the host's default file-descriptor
     # limit is easily exhausted ("Too many open files"), which corrupts writes and
     # crashes the backend on its next boot. Raise the limit so it stays healthy.
@@ -174,6 +197,9 @@ services:
       SNAPSHOT_EVERY_TICKS: ${SNAPSHOT_EVERY_TICKS:-50}
       # Slowed world clock so villagers stay near each other between thoughts.
       WORLD_TICK_RATE: ${WORLD_TICK_RATE:-3}
+      # Master TIME-SCALE: >1 runs the WHOLE sim faster in lock-step (movement, the
+      # in-world clock, needs/economy/weather, think cadence); 1 = normal. [0.1, 20].
+      SIM_SPEED: ${SIM_SPEED:-2}
       # WORLD CREATION. When there is NO world yet, the FRONTEND shows a first-run
       # setup screen: pick auto-generate (LLM) with a STYLE (desert, alien, water…),
       # a villager count and a size — or the classic hand-crafted village. The result
@@ -209,6 +235,8 @@ services:
       SUPERVISOR_MIN_DAYS_BETWEEN_ACTS: ${SUPERVISOR_MIN_DAYS_BETWEEN_ACTS:-1}
       VILLAGER_TICKS_PER_DAY: ${VILLAGER_TICKS_PER_DAY:-1000}
       MIN_ROUND_MS: ${MIN_ROUND_MS:-3000}
+      VILLAGER_BRAIN: utility
+      RIVAL_VILLAGE: on
     # No host port: the browser never reaches the gateway directly. `core` talks
     # to mongo/qdrant/llm; `edge` is the lone link the client's nginx proxies over.
     networks: [core, edge]

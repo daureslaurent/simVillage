@@ -84,6 +84,29 @@ export class RelationshipBook {
     return this.all();
   }
 
+  /**
+   * v3 P4 — a LIGHT affinity nudge with no opinion change, for the utility brain's
+   * cheap social dynamics: time spent in good company warms a tie, friction cools it.
+   * Unlike {@link apply} (the nightly reflection's heavy, opinion-bearing revision)
+   * this only moves the number, clamped to range, and seeds a neutral tie on first
+   * contact. Returns true when the affinity actually changed, so the caller can decide
+   * whether to persist/stream the book.
+   */
+  nudge(otherId: string, otherName: string, delta: number, tick: number): boolean {
+    if (!otherId || delta === 0) return false;
+    const existing = this.ties.get(otherId);
+    const next = clamp((existing?.affinity ?? 0) + delta, AFFINITY_MIN, AFFINITY_MAX);
+    if (existing && next === existing.affinity) return false;
+    this.ties.set(otherId, {
+      otherId,
+      otherName: otherName || existing?.otherName || otherId,
+      affinity: next,
+      opinion: existing?.opinion ?? '',
+      lastTick: tick,
+    });
+    return true;
+  }
+
   /** A serialisable snapshot, for persistence. */
   toArray(): Relationship[] {
     return this.all();

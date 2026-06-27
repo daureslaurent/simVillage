@@ -44,8 +44,29 @@ import type {
   WorldSeed,
   WorldStateUpdate,
 } from '../../shared/types';
-import { BACKPACK_CAPACITY } from '../../shared/types';
+import { BACKPACK_CAPACITY, DEFAULT_VILLAGE_ID } from '../../shared/types';
+import type { SpawnableType } from '../../shared/types';
 import { deriveAppearance } from '../../shared/appearance';
+import {
+  VILLAGER_MAX_LIFE,
+  VILLAGER_RECOVER_LIFE,
+  VILLAGER_REGEN_PER_ROUND,
+  buildingMaxLife,
+  fortFootprint,
+  isFortification,
+  isWall,
+  isGate,
+  COMBAT_REACH,
+  COMBAT_DAMAGE_PER_ROUND,
+  RAID_WALL_DAMAGE_PER_ROUND,
+  SIEGE_RAM_DAMAGE_PER_ROUND,
+  SIEGE_REACH,
+  GATE_HOLD_REACH,
+  BARRACKS_RALLY_REACH,
+  BARRACKS_DAMAGE_MULT,
+  WAR_CAMP_RALLY_REACH,
+  WAR_CAMP_DAMAGE_MULT,
+} from '../../shared/fortifications';
 import {
   AMBIENCE_RADIUS,
   BUILDING_CAPACITY,
@@ -131,10 +152,11 @@ const MIN_SLEEP_ROUNDS = Math.round((2 * 3600) / SIM_SECONDS_PER_TICK);
 const BOREDOM_RATE = 0.13;
 /**
  * How much boredom eases each round while a villager stands in a GATHERING (company).
- * Outpaces the per-round creep, so socializing has a payoff — and so that, once
- * boredom is low, the urge to keep chatting fades on its own (a brake on idle talk).
+ * Kept BELOW the per-round creep ({@link BOREDOM_RATE}) so company only SLOWS the dullness
+ * rather than zeroing it — a herd loitering together still grows restless over time and
+ * eventually peels off to the tavern or to work, instead of standing pinned at one spot.
  */
-const GATHERING_BOREDOM_RELIEF = 1.0;
+const GATHERING_BOREDOM_RELIEF = 0.1;
 
 /**
  * How many clock ticks (rounds) a refused-work status NOTICE lingers before it
@@ -217,6 +239,11 @@ function defaultNeeds(): VillagerNeeds {
 /** Clamp a need to its valid 0..100 range. */
 function clampNeed(value: number): number {
   return Math.max(0, Math.min(100, value));
+}
+
+/** Clamp a life value to [0, max] (v3 war health). */
+function clampLife(value: number, max: number): number {
+  return Math.max(0, Math.min(max, value));
 }
 
 /** Strongly-typed map of the events the engine emits. */
@@ -306,6 +333,14 @@ export class WorldEngine {
    */
   private readonly sleepUntil = new Map<string, { from: number; until: number; fatigue0: number }>();
 
+  /**
+   * Cached navigation paths per mobile body (v3 war). When a body's straight line to
+   * its target is blocked by a wall, it follows an A* route of waypoints stored here
+   * instead. Invalidated wholesale whenever the static grid changes (a wall raised or
+   * breached), and per-body when the target changes or the route is walked out.
+   */
+  private readonly paths = new Map<string, { goal: Vec2; waypoints: Vec2[] }>();
+
   /** Current village-wide weather, set by the God Agent. Broadcast to observers. */
   private weather: WeatherKind = 'clear';
 
@@ -318,6 +353,10 @@ export class WorldEngine {
   private readonly setting: string;
   /** Themed ground colours, carried from the seed into world.init (undefined = old save). */
   private readonly palette: TerrainPalette | undefined;
+  /** Second ground palette for the rival (east) side of a two-village world (undefined = single village). */
+  private readonly rivalPalette: TerrainPalette | undefined;
+  /** Tile x where the ground switches from `palette` to `rivalPalette` (undefined = single village). */
+  private readonly paletteSplitX: number | undefined;
 
   /** Monotonic counter for God-spawned entity ids, so they never collide. */
   private spawnSeq = 0;
@@ -339,6 +378,8 @@ export class WorldEngine {
     this.theme = seed.theme ?? '';
     this.setting = seed.setting ?? '';
     this.palette = seed.palette;
+    this.rivalPalette = seed.rivalPalette;
+    this.paletteSplitX = seed.paletteSplitX;
     this.staticOccupancy = new Uint8Array(this.width * this.height);
 
     // Load the seed into live state. Clone positions so external seed objects
@@ -351,8 +392,13 @@ export class WorldEngine {
     // and carry a live resource stock (normalised so old saves get sensible
     // defaults). Only the stock mutates during play; everything else is fixed.
     for (const building of seed.buildings ?? []) {
-      this.entities.set(building.id, this.normaliseBuilding(building));
-      this.markStaticRect(building.position.x, building.position.y, building.width, building.height);
+      const live = this.normaliseBuilding(building);
+      this.entities.set(building.id, live);
+      // A gate is the one building whose footprint must stay WALKABLE — it is the way
+      // through a wall. Everything else (walls included) reserves its ground.
+      if (!isGate(live.kind)) {
+        this.markStaticRect(live.position.x, live.position.y, live.width, live.height);
+      }
     }
     // Heal worlds saved before the technical depot existed: every village needs one
     // (it is where the cart fleet is dispatched from), so mint one on free ground near
@@ -371,6 +417,11 @@ export class WorldEngine {
     // resumes weather, sleepers, work sessions, status notices, and the spawn
     // counter rather than starting clean. All optional (absent in fresh/old seeds).
     this.restoreTransient(seed);
+
+    // Give every villager its own home: match existing houses to villagers who lack
+    // one (a fresh hand-crafted seed, an LLM-generated world, or a pre-housing save all
+    // arrive without assignments). Surplus villagers stay homeless until a house is built.
+    this.reconcileHomes();
   }
 
   /**
@@ -518,6 +569,12 @@ export class WorldEngine {
       // A villager with no power left sleeps: the body lies still and the mind goes
       // dark (the coordinator stops granting it turns). Skip its normal stepping.
       if (this.stepSleep(villager)) continue;
+      // A DOWNED villager (beaten to 0 life) is retreating home and out of the fight:
+      // it only walks toward the bed its war-step pointed it at, nothing more.
+      if (villager.downed) {
+        this.stepVillager(villager);
+        continue;
+      }
       this.stepTask(villager, newRound); // navigate every frame; convert once per round
       this.stepVillager(villager);
       this.stepNeeds(villager, gathered.has(villager.id), fatigueMult, effect.thirst, newRound);
@@ -525,6 +582,9 @@ export class WorldEngine {
     // Carts run their standing orders on their own: they DRIVE every physics tick so
     // hauling stays smooth, but only load/unload (mutate stock) once per round.
     for (const cart of this.carts()) this.stepCart(cart, newRound);
+    // The WAR layer (v3): skirmishes at contested gates, walls battered toward a
+    // breach, the fallen retreating to heal. Resolved once per in-world round.
+    if (newRound) this.stepWar();
     this.tickCount += 1;
     this.emit('tick', this.getStateUpdate());
   }
@@ -750,29 +810,512 @@ export class WorldEngine {
     this.stepToward(villager);
   }
 
+  // -------------------------------------------------------------------------
+  // The WAR layer (v3 rival competition) — combat, sieges, and recovery.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve one round of the war between villages: villagers of different villages
+   * standing toe to toe trade blows; raiders and siege rams batter rival walls toward
+   * a breach; gates re-read whether a defender is holding them; the fallen retreat to
+   * heal and everyone else mends slowly. There is no death — a villager beaten to 0
+   * life is DOWNED and flees home, rejoining once recovered. Re-announces the static
+   * world if any wall was breached so observers see the gap open.
+   */
+  private stepWar(): void {
+    const villagers = this.villagers().filter((v) => !v.asleep);
+    const fought = new Set<string>();
+    let breached = false;
+
+    // 1) SKIRMISHES — any two villagers of different villages within reach fight. Each
+    //    strikes with whatever edge its own muster buildings lend (barracks/war camp).
+    for (let i = 0; i < villagers.length; i++) {
+      for (let j = i + 1; j < villagers.length; j++) {
+        const a = villagers[i]!;
+        const b = villagers[j]!;
+        if (a.downed || b.downed) continue;
+        if ((a.villageId ?? DEFAULT_VILLAGE_ID) === (b.villageId ?? DEFAULT_VILLAGE_ID)) continue;
+        if (this.chebyshevPts(a.position, b.position) > COMBAT_REACH) continue;
+        const aDealt = COMBAT_DAMAGE_PER_ROUND * this.fighterMult(a);
+        const bDealt = COMBAT_DAMAGE_PER_ROUND * this.fighterMult(b);
+        this.damageVillager(b, aDealt);
+        this.damageVillager(a, bDealt);
+        fought.add(a.id);
+        fought.add(b.id);
+      }
+    }
+
+    // 2) WALLS UNDER SIEGE — raiders (bare-handed) and siege rams batter rival
+    //    walls/gates. Track which walls took damage this round to clear the bar on the rest.
+    const ramparts = this.buildings().filter((b) => isWall(b.kind) || isGate(b.kind));
+    const besieged = new Set<string>();
+    for (const v of villagers) {
+      if (v.downed) continue;
+      for (const w of ramparts) {
+        if ((w.villageId ?? DEFAULT_VILLAGE_ID) === (v.villageId ?? DEFAULT_VILLAGE_ID)) continue;
+        if (this.rectDistance(v.position, w) > SIEGE_REACH) continue;
+        const mult = this.nearFriendly(v.position, v.villageId, 'war_camp', WAR_CAMP_RALLY_REACH)
+          ? WAR_CAMP_DAMAGE_MULT
+          : 1;
+        besieged.add(w.id);
+        fought.add(v.id);
+        if (this.damageBuilding(w, RAID_WALL_DAMAGE_PER_ROUND * mult)) breached = true;
+      }
+    }
+    for (const ram of this.buildings().filter((b) => b.kind === 'siege_ram')) {
+      const centre = { x: ram.position.x + ram.width / 2, y: ram.position.y + ram.height / 2 };
+      for (const w of ramparts) {
+        if ((w.villageId ?? DEFAULT_VILLAGE_ID) === (ram.villageId ?? DEFAULT_VILLAGE_ID)) continue;
+        if (this.rectDistance(centre, w) > SIEGE_REACH) continue;
+        besieged.add(w.id);
+        if (this.damageBuilding(w, SIEGE_RAM_DAMAGE_PER_ROUND)) breached = true;
+      }
+    }
+    // Walls not under siege this round have no live siege bar.
+    for (const w of ramparts) if (!besieged.has(w.id) && w.siegeProgress !== undefined) delete w.siegeProgress;
+
+    // 3) GATES — a gate stands OPEN unless a friendly defender is holding it close.
+    for (const gate of this.buildings().filter((b) => isGate(b.kind))) {
+      const held = villagers.some(
+        (v) =>
+          !v.downed &&
+          (v.villageId ?? DEFAULT_VILLAGE_ID) === (gate.villageId ?? DEFAULT_VILLAGE_ID) &&
+          this.rectDistance(v.position, gate) <= GATE_HOLD_REACH,
+      );
+      gate.open = !held;
+    }
+
+    // 4) RECOVERY — the downed flee home and mend; everyone out of the fight heals slowly.
+    for (const v of villagers) {
+      const max = v.maxLife ?? VILLAGER_MAX_LIFE;
+      if (!fought.has(v.id)) v.life = clampLife((v.life ?? max) + VILLAGER_REGEN_PER_ROUND, max);
+      if (v.downed) {
+        if (!v.target) {
+          const home = this.homeFor(v);
+          if (home) v.target = home;
+        }
+        v.status = 'Downed — retreating to recover';
+        if ((v.life ?? 0) >= VILLAGER_RECOVER_LIFE) {
+          v.downed = false;
+          v.status = 'Recovered';
+        }
+      }
+    }
+
+    if (breached) this.emit('init', this.getInitMessage());
+  }
+
+  /** Chebyshev (king-move) distance between two points. */
+  private chebyshevPts(a: Vec2, b: Vec2): number {
+    return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
+  }
+
+  /**
+   * The damage multiplier a villager fights with, lent by its OWN nearby muster
+   * buildings: a barracks (or watchtower, lookouts readying the defence) sharpens a
+   * defender, a war camp emboldens a raider. Multipliers stack if both are near.
+   */
+  private fighterMult(v: Villager): number {
+    let mult = 1;
+    if (
+      this.nearFriendly(v.position, v.villageId, 'barracks', BARRACKS_RALLY_REACH) ||
+      this.nearFriendly(v.position, v.villageId, 'watchtower', BARRACKS_RALLY_REACH)
+    ) {
+      mult *= BARRACKS_DAMAGE_MULT;
+    }
+    if (this.nearFriendly(v.position, v.villageId, 'war_camp', WAR_CAMP_RALLY_REACH)) {
+      mult *= WAR_CAMP_DAMAGE_MULT;
+    }
+    return mult;
+  }
+
+  /** True when a friendly building of `kind` (same village) sits within `reach` of a point. */
+  private nearFriendly(at: Vec2, villageId: string | undefined, kind: BuildingKind, reach: number): boolean {
+    const mine = villageId ?? DEFAULT_VILLAGE_ID;
+    for (const b of this.buildings()) {
+      if (b.kind !== kind) continue;
+      if ((b.villageId ?? DEFAULT_VILLAGE_ID) !== mine) continue;
+      if (this.rectDistance(at, b) <= reach) return true;
+    }
+    return false;
+  }
+
+  /** Apply combat damage to a villager; a villager driven to 0 life is DOWNED, not killed. */
+  private damageVillager(v: Villager, amount: number): void {
+    const max = v.maxLife ?? VILLAGER_MAX_LIFE;
+    v.life = clampLife((v.life ?? max) - amount, max);
+    if (v.life <= 0 && !v.downed) {
+      v.downed = true;
+      v.life = 1; // never quite gone — a sliver to mend from
+      v.task = null;
+      v.target = this.homeFor(v);
+      this.paths.delete(v.id);
+      this.emitVillagerNotice(v, 'Beaten back — retreating home, wounded');
+    }
+  }
+
+  /**
+   * Apply siege damage to a wall/gate, updating its breach bar. Returns true and razes
+   * the piece (freeing its ground) when its life reaches 0 — the breach is open.
+   */
+  private damageBuilding(b: Building, amount: number): boolean {
+    const max = b.maxLife ?? buildingMaxLife(b.kind);
+    b.life = clampLife((b.life ?? max) - amount, max);
+    b.siegeProgress = 1 - b.life / max;
+    if (b.life <= 0) {
+      this.destroyBuilding(b);
+      return true;
+    }
+    return false;
+  }
+
+  /** Remove a (fortification) building from the world, freeing its reserved ground. */
+  private destroyBuilding(b: Building): void {
+    this.entities.delete(b.id);
+    if (!isGate(b.kind)) this.clearStaticRect(b.position.x, b.position.y, b.width, b.height);
+    // The map's walkability changed: every cached route may now be stale.
+    this.paths.clear();
+    console.log(`[engine] ${b.kind} ${b.name} (${b.id}) was destroyed`);
+  }
+
+  /**
+   * Where a villager goes to REST or recover: its OWN home if it has one standing,
+   * else the nearest friendly house (a homeless newcomer still needs a bed). Returns a
+   * free tile beside the house's footprint, or null when the village has no house yet.
+   */
+  private homeFor(v: Villager): Vec2 | null {
+    const own = v.homeId ? this.entities.get(v.homeId) : undefined;
+    if (own && own.type === 'building' && (own as Building).kind === 'house') {
+      const h = own as Building;
+      return this.nearestFreeTile(h.position.x + h.width / 2, h.position.y + h.height / 2);
+    }
+    return this.nearestFriendlyHouse(v);
+  }
+
+  /** The nearest free tile beside a friendly house, for a downed/homeless villager to limp to. */
+  private nearestFriendlyHouse(v: Villager): Vec2 | null {
+    const mine = v.villageId ?? DEFAULT_VILLAGE_ID;
+    let best: { b: Building; d: number } | null = null;
+    for (const b of this.buildings()) {
+      if (b.kind !== 'house') continue;
+      if ((b.villageId ?? DEFAULT_VILLAGE_ID) !== mine) continue;
+      const d = this.rectDistance(v.position, b);
+      if (best === null || d < best.d) best = { b, d };
+    }
+    if (!best) return null;
+    return this.nearestFreeTile(best.b.position.x + best.b.width / 2, best.b.position.y + best.b.height / 2);
+  }
+
+  // -------------------------------------------------------------------------
+  // Housing — one house per villager (v3)
+  // -------------------------------------------------------------------------
+
+  /** Every villager belonging to a village. */
+  private villagersOfVillage(villageId: string): Villager[] {
+    return this.villagers().filter((v) => (v.villageId ?? DEFAULT_VILLAGE_ID) === villageId);
+  }
+
+  /** Every finished house belonging to a village (construction sites excluded). */
+  private housesOfVillage(villageId: string): Building[] {
+    return this.buildings().filter(
+      (b) => b.kind === 'house' && (b.villageId ?? DEFAULT_VILLAGE_ID) === villageId,
+    );
+  }
+
+  /** True when this villager has a standing house assigned to it. */
+  private hasHome(v: Villager): boolean {
+    if (!v.homeId) return false;
+    const home = this.entities.get(v.homeId);
+    return !!home && home.type === 'building' && (home as Building).kind === 'house';
+  }
+
+  /** How many villagers in a village still lack a home — the village's housing shortfall. */
+  private homelessCount(villageId: string): number {
+    return this.villagersOfVillage(villageId).filter((v) => !this.hasHome(v)).length;
+  }
+
+  /**
+   * Match free houses to villagers who lack one, in EVERY village. Run after a house is
+   * raised, after a newcomer arrives, and once on load — so each villager ends up owning
+   * exactly one home, and an assignment whose house was razed in war is cleared and the
+   * villager re-housed when a spare exists.
+   */
+  private reconcileHomes(): void {
+    const villages = new Set<string>();
+    for (const v of this.villagers()) villages.add(v.villageId ?? DEFAULT_VILLAGE_ID);
+    for (const villageId of villages) {
+      const villagers = this.villagersOfVillage(villageId);
+      // Clear assignments whose house no longer stands.
+      for (const v of villagers) if (v.homeId && !this.hasHome(v)) delete v.homeId;
+      const taken = new Set(villagers.map((v) => v.homeId).filter((id): id is string => !!id));
+      const free = this.housesOfVillage(villageId).filter((h) => !taken.has(h.id));
+      for (const v of villagers) {
+        if (v.homeId) continue;
+        const house = free.shift();
+        if (!house) break;
+        v.homeId = house.id;
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Organized placement — a zoned grid (v3)
+  // -------------------------------------------------------------------------
+
+  /** Tiles left clear between buildings so a finished settlement reads as tidy streets. */
+  private static readonly BUILD_GAP = 2;
+  /** Houses per residential COLUMN before a new column is started, away from the core. */
+  private static readonly HOUSES_PER_COLUMN = 5;
+
+  /** The civic HEART of a village: its town hall's centre, else the mean of its buildings. */
+  private villageCore(villageId: string): Vec2 {
+    const mine = this.buildings().filter((b) => (b.villageId ?? DEFAULT_VILLAGE_ID) === villageId);
+    const hall = mine.find((b) => b.kind === 'hall_town');
+    if (hall) return { x: hall.position.x + hall.width / 2, y: hall.position.y + hall.height / 2 };
+    if (mine.length > 0) {
+      const sx = mine.reduce((s, b) => s + b.position.x + b.width / 2, 0) / mine.length;
+      const sy = mine.reduce((s, b) => s + b.position.y + b.height / 2, 0) / mine.length;
+      return { x: sx, y: sy };
+    }
+    return { x: this.width / 2, y: this.height / 2 };
+  }
+
+  /**
+   * Pick ORGANIZED ground for a new structure (v3): houses fill a residential grid laid
+   * OUTWARD from the civic core (away from the contested midline), in tidy columns; civic
+   * and economy buildings cluster on a grid ring AROUND the core. Returns the top-left
+   * tile of the first free, grid-aligned slot, or null when the zone is full (the caller
+   * then falls back to a free-form search near the requested tile).
+   */
+  private organizedSite(villageId: string, kind: BuildingKind, w: number, h: number): { x: number; y: number } | null {
+    const core = this.villageCore(villageId);
+    const gap = WorldEngine.BUILD_GAP;
+    const pitchX = w + gap;
+    const pitchY = h + gap;
+    if (kind === 'house') {
+      // Houses sit in their own neighbourhood, laid out in columns marching OUTWARD from
+      // the core (away from the map's contested centre line) so homes stay behind the
+      // civic buildings rather than on the front.
+      const outward = core.x < this.width / 2 ? -1 : 1;
+      const perCol = WorldEngine.HOUSES_PER_COLUMN;
+      const startX = Math.round(core.x + outward * (pitchX + gap)); // clear the civic core first
+      const startY = Math.round(core.y - Math.floor(perCol / 2) * pitchY);
+      for (let k = 0; k < perCol * 24; k++) {
+        const col = Math.floor(k / perCol);
+        const row = k % perCol;
+        const x = startX + outward * col * pitchX - Math.floor(w / 2);
+        const y = startY + row * pitchY - Math.floor(h / 2);
+        if (this.rectIsFree(x, y, w, h)) return { x, y };
+      }
+      return null;
+    }
+    // Civic / economy: nearest free grid slot to the core, ring by ring, so they form a
+    // compact, aligned heart rather than scattering.
+    const baseX = Math.round(core.x) - Math.floor(w / 2);
+    const baseY = Math.round(core.y) - Math.floor(h / 2);
+    for (let r = 1; r <= 14; r++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue; // ring perimeter only
+          const x = baseX + dx * pitchX;
+          const y = baseY + dy * pitchY;
+          if (this.rectIsFree(x, y, w, h)) return { x, y };
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Post a short status notice over a villager (reused by the war layer for combat flavour). */
+  private emitVillagerNotice(v: Villager, text: string): void {
+    this.notices.set(v.id, { text, untilTick: this.clockTick + 30 });
+  }
+
   /**
    * Move any mobile body one `speed` increment straight toward its `target`, if any,
    * snapping (and clearing the target) on arrival. Shared by villagers and carts so
    * both walk the world the same way — straight line, no occupancy checks, overlap
    * allowed (see {@link stepVillager}). Carts simply carry a larger `speed`.
    */
-  private stepToward(body: { position: Vec2; target: Vec2 | null; speed: number }): void {
-    if (!body.target) return;
-
-    const dx = body.target.x - body.position.x;
-    const dy = body.target.y - body.position.y;
-    const distance = Math.hypot(dx, dy);
-
-    if (distance <= body.speed) {
-      // Close enough to arrive this tick: snap exactly and stop.
-      body.position.x = body.target.x;
-      body.position.y = body.target.y;
-      body.target = null;
+  private stepToward(body: { id: string; position: Vec2; target: Vec2 | null; speed: number }): void {
+    if (!body.target) {
+      this.paths.delete(body.id);
       return;
     }
 
+    // FAST PATH: when the straight line to the target crosses no blocked tile (the
+    // overwhelmingly common case — no walls in the way), walk it directly. This keeps
+    // movement exactly as cheap as before whenever fortifications aren't involved.
+    if (this.lineClear(body.position, body.target)) {
+      this.paths.delete(body.id);
+      this.stepStraight(body, body.target);
+      return;
+    }
+
+    // BLOCKED: a wall lies across the straight line. Follow a cached A* route to the
+    // target, recomputing it when the target changed or the previous route ran out.
+    let nav = this.paths.get(body.id);
+    const goalKey = (p: Vec2): string => `${Math.round(p.x)},${Math.round(p.y)}`;
+    if (!nav || goalKey(nav.goal) !== goalKey(body.target)) {
+      nav = { goal: { ...body.target }, waypoints: this.findPath(body.position, body.target) ?? [] };
+      this.paths.set(body.id, nav);
+    }
+    if (nav.waypoints.length === 0) {
+      // No route exists (or the search was capped): nudge straight so the body never
+      // freezes forever — it will keep trying as the world changes (e.g. a breach).
+      this.stepStraight(body, body.target);
+      return;
+    }
+    const next = nav.waypoints[0]!;
+    this.stepStraight(body, next);
+    if (Math.hypot(next.x - body.position.x, next.y - body.position.y) < 1e-6) {
+      nav.waypoints.shift();
+    }
+  }
+
+  /**
+   * Move a body one `speed` increment straight toward `dest`, snapping on arrival.
+   * Clears `target` (and the cached path) only when `dest` IS the body's final target,
+   * so following an intermediate waypoint doesn't end the journey early.
+   */
+  private stepStraight(
+    body: { id: string; position: Vec2; target: Vec2 | null; speed: number },
+    dest: Vec2,
+  ): void {
+    const dx = dest.x - body.position.x;
+    const dy = dest.y - body.position.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance <= body.speed) {
+      body.position.x = dest.x;
+      body.position.y = dest.y;
+      if (body.target && Math.round(dest.x) === Math.round(body.target.x) && Math.round(dest.y) === Math.round(body.target.y)) {
+        body.target = null;
+        this.paths.delete(body.id);
+      }
+      return;
+    }
     body.position.x += (dx / distance) * body.speed;
     body.position.y += (dy / distance) * body.speed;
+  }
+
+  /** A tile is walkable when it is in-bounds and not statically occupied (wall/tree/footprint). */
+  private tilePassable(x: number, y: number): boolean {
+    const ix = Math.round(x);
+    const iy = Math.round(y);
+    if (ix < 0 || iy < 0 || ix >= this.width || iy >= this.height) return false;
+    return this.staticOccupancy[iy * this.width + ix] === 0;
+  }
+
+  /** True when the straight segment from→to crosses no blocked tile (sampled per half-tile). */
+  private lineClear(from: Vec2, to: Vec2): boolean {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) * 2));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      if (!this.tilePassable(from.x + dx * t, from.y + dy * t)) return false;
+    }
+    return true;
+  }
+
+  /** Octile distance heuristic for the grid A*. */
+  private octile(ax: number, ay: number, bx: number, by: number): number {
+    const dx = Math.abs(ax - bx);
+    const dy = Math.abs(ay - by);
+    return Math.max(dx, dy) + (Math.SQRT2 - 1) * Math.min(dx, dy);
+  }
+
+  /**
+   * Grid A* over walkable tiles from `from` to `to`, 8-connected with no corner-cutting
+   * through wall corners. Returns the route as tile-centre waypoints (start excluded,
+   * goal included), simplified to direction-changes; or null if the goal is unreachable
+   * or the search hit its expansion cap (the caller then falls back to a straight nudge).
+   */
+  private findPath(from: Vec2, to: Vec2): Vec2[] | null {
+    const W = this.width;
+    const sx = Math.round(from.x);
+    const sy = Math.round(from.y);
+    const gx = Math.round(to.x);
+    const gy = Math.round(to.y);
+    if (!this.tilePassable(gx, gy)) return null;
+    const start = sy * W + sx;
+    const goal = gy * W + gx;
+    if (start === goal) return [{ x: gx, y: gy }];
+
+    const cameFrom = new Map<number, number>();
+    const g = new Map<number, number>([[start, 0]]);
+    const f = new Map<number, number>([[start, this.octile(sx, sy, gx, gy)]]);
+    const open = new Set<number>([start]);
+    const dirs = [
+      [1, 0], [-1, 0], [0, 1], [0, -1],
+      [1, 1], [1, -1], [-1, 1], [-1, -1],
+    ];
+    let pops = 0;
+    const MAX_POPS = 8000;
+
+    while (open.size > 0) {
+      if (++pops > MAX_POPS) return null;
+      // Pick the open node with the lowest f. A linear scan is plenty: the open set
+      // stays small for the short, local detours a wall actually forces.
+      let cur = -1;
+      let bestF = Infinity;
+      for (const n of open) {
+        const fn = f.get(n) ?? Infinity;
+        if (fn < bestF) {
+          bestF = fn;
+          cur = n;
+        }
+      }
+      if (cur === goal) return this.reconstructPath(cameFrom, cur, W);
+      open.delete(cur);
+      const cx = cur % W;
+      const cy = Math.floor(cur / W);
+      for (const [dx, dy] of dirs) {
+        const nx = cx + dx!;
+        const ny = cy + dy!;
+        if (!this.tilePassable(nx, ny)) continue;
+        // No cutting a wall's corner: a diagonal needs both orthogonal sides clear.
+        if (dx !== 0 && dy !== 0 && (!this.tilePassable(cx + dx!, cy) || !this.tilePassable(cx, cy + dy!))) continue;
+        const nn = ny * W + nx;
+        const step = dx !== 0 && dy !== 0 ? Math.SQRT2 : 1;
+        const tentative = (g.get(cur) ?? Infinity) + step;
+        if (tentative < (g.get(nn) ?? Infinity)) {
+          cameFrom.set(nn, cur);
+          g.set(nn, tentative);
+          f.set(nn, tentative + this.octile(nx, ny, gx, gy));
+          open.add(nn);
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Rebuild a tile-centre waypoint list from the A* came-from chain, simplifying runs. */
+  private reconstructPath(cameFrom: Map<number, number>, goal: number, W: number): Vec2[] {
+    const tiles: Vec2[] = [];
+    let n: number | undefined = goal;
+    while (n !== undefined && cameFrom.has(n)) {
+      tiles.push({ x: n % W, y: Math.floor(n / W) });
+      n = cameFrom.get(n);
+    }
+    tiles.reverse(); // start excluded, goal last
+    // Drop interior waypoints that don't change direction — fewer, straighter hops.
+    const out: Vec2[] = [];
+    for (let i = 0; i < tiles.length; i++) {
+      const prev = out[out.length - 1];
+      const cur = tiles[i]!;
+      const nxt = tiles[i + 1];
+      if (!prev || !nxt) {
+        out.push(cur);
+        continue;
+      }
+      const d1x = Math.sign(cur.x - prev.x);
+      const d1y = Math.sign(cur.y - prev.y);
+      const d2x = Math.sign(nxt.x - cur.x);
+      const d2y = Math.sign(nxt.y - cur.y);
+      if (d1x !== d2x || d1y !== d2y) out.push(cur);
+    }
+    return out;
   }
 
   /**
@@ -814,7 +1357,7 @@ export class WorldEngine {
       villager.needs.fatigue >= HOUSE_SLEEP_THRESHOLD &&
       !villager.target &&
       !villager.task &&
-      this.houseNear(villager.position)
+      this.ownHomeNear(villager)
     ) {
       this.fallAsleep(villager, 'went to bed at home');
       return true;
@@ -852,6 +1395,19 @@ export class WorldEngine {
       if (this.rectDistance(p, b) <= SERVICE_REACH) return b;
     }
     return null;
+  }
+
+  /**
+   * True when a villager is standing within reach of its OWN home — the only place it
+   * turns in for the night. A homeless villager (newcomer awaiting a house) falls back
+   * to any nearby house so it can still rest until one is raised for it.
+   */
+  private ownHomeNear(v: Villager): boolean {
+    const own = v.homeId ? this.entities.get(v.homeId) : undefined;
+    if (own && own.type === 'building' && (own as Building).kind === 'house') {
+      return this.rectDistance(v.position, own as Building) <= SERVICE_REACH;
+    }
+    return this.houseNear(v.position) !== null;
   }
 
   /**
@@ -1052,6 +1608,7 @@ export class WorldEngine {
     const depot: Building = {
       id: `building_depot_${this.spawnSeq}`,
       type: 'building',
+      villageId: DEFAULT_VILLAGE_ID,
       kind: 'depot',
       name: "The Cartwright's Depot",
       function: BUILDING_FUNCTIONS.depot,
@@ -1114,7 +1671,7 @@ export class WorldEngine {
         this.handleForceMove(command.villagerId, command.x, command.y);
         return;
       case 'spawn_entity':
-        this.handleSpawnEntity(command.entityType, command.x, command.y);
+        this.handleSpawnEntity(command.entityType, command.x, command.y, command.length, command.orientation);
         return;
       case 'set_weather':
         this.handleSetWeather(command.weather);
@@ -1169,6 +1726,9 @@ export class WorldEngine {
       console.warn(`[engine] force_move: unknown villager "${targetId}" — ignored`);
       return;
     }
+    // A DOWNED villager is retreating to recover and obeys no orders until it is back
+    // on its feet — its mind is quiet, so ignore any movement intent meanwhile.
+    if (entity.downed) return;
     // Be forgiving about the destination. A mind (or a God-Hand click) will often
     // aim AT a building — e.g. the well's centre tile — but building footprints are
     // blocked, so a literal move there is impossible. Rather than silently dropping
@@ -1423,9 +1983,27 @@ export class WorldEngine {
       console.log(`[engine] start_build: ${openSites} sites already open — refused`);
       return;
     }
-    // Find clear ground for the footprint, searching outward from the chosen tile so
-    // a spot inside the forest or atop another building lands on the nearest opening.
-    const at = this.findFreeRect(x, y, spec.width, spec.height);
+    const villageId = villager.villageId ?? DEFAULT_VILLAGE_ID;
+    // One house per villager: refuse a new house once everyone is already housed (an
+    // open house site counts as a home-in-progress, so we don't over-build).
+    if (spec.kind === 'house') {
+      const pending = this.buildings().filter(
+        (b) => isConstructionSite(b.kind) &&
+          b.construction?.targetKind === 'house' &&
+          (b.villageId ?? DEFAULT_VILLAGE_ID) === villageId,
+      ).length;
+      if (this.homelessCount(villageId) <= pending) {
+        this.setNotice(villager.id, `Everyone in the village already has a home — no new house is needed.`);
+        console.log(`[engine] start_build: ${villageId} fully housed — house refused`);
+        return;
+      }
+    }
+    // Place it on the ORGANIZED zoned grid (houses in their neighbourhood, civic around
+    // the core); fall back to a free-form search near the requested tile if the zone is
+    // full, so a build never silently fails for want of a tidy slot.
+    const at =
+      (spec.kind ? this.organizedSite(villageId, spec.kind, spec.width, spec.height) : null) ??
+      this.findFreeRect(x, y, spec.width, spec.height);
     if (!at) {
       this.setNotice(villager.id, `There is no clear ground near (${Math.round(x)}, ${Math.round(y)}) to raise ${spec.label}.`);
       console.log(`[engine] start_build: no clear ${spec.width}x${spec.height} ground near (${x}, ${y}) — refused`);
@@ -1450,6 +2028,9 @@ export class WorldEngine {
     const site: Building = {
       id: `building_site_${this.spawnSeq}`,
       type: 'building',
+      // The site (and the structure it becomes) belongs to whoever raised it, so a
+      // rival's build never reads as ours. Single-village builders carry the default.
+      villageId: villager.villageId ?? DEFAULT_VILLAGE_ID,
       kind: 'construction_site',
       name: `${targetName} (building site)`,
       function: BUILDING_FUNCTIONS.construction_site,
@@ -1569,6 +2150,8 @@ export class WorldEngine {
     site.stock = stock;
     delete site.construction;
     console.log(`[engine] "${targetName}" finished — now a ${targetKind}`);
+    // A finished house gets handed to a villager who has none yet (one home each).
+    if (targetKind === 'house') this.reconcileHomes();
     this.emitBuildingEvent(site, 'completed', { actor: finisher, note: `raised a ${targetKind}` });
     // Re-announce so observers swap the half-built shell for the finished building.
     this.emit('init', this.getInitMessage());
@@ -1601,6 +2184,8 @@ export class WorldEngine {
     const cart: Cart = {
       id: `cart_${this.spawnSeq}`,
       type: 'cart',
+      // The new cart belongs to the village whose site produced it.
+      villageId: site.villageId ?? DEFAULT_VILLAGE_ID,
       name: `${spec.label} ${ordinal}`,
       tier,
       width: spec.width,
@@ -1752,7 +2337,20 @@ export class WorldEngine {
    * per-tick payload carries only villagers); a spawned villager is picked up by the
    * very next tick automatically. Invalid tiles are ignored, never thrown.
    */
-  private handleSpawnEntity(entityType: 'villager' | 'tree', x: number, y: number): void {
+  private handleSpawnEntity(
+    entityType: SpawnableType,
+    x: number,
+    y: number,
+    length?: number,
+    orientation?: 'h' | 'v',
+  ): void {
+    // FORTIFICATIONS take their own placement path: walls/gates lay in lines and the
+    // muster buildings reserve a footprint, all carrying `life`. (See placeFortification.)
+    if (isFortification(entityType as BuildingKind)) {
+      this.placeFortification(entityType as BuildingKind, x, y, length, orientation);
+      return;
+    }
+
     if (!this.isValidDestination(x, y)) {
       console.warn(`[engine] spawn_entity: invalid tile (${x}, ${y}) — ignored`);
       return;
@@ -1777,6 +2375,8 @@ export class WorldEngine {
       id: spawnId,
       name: 'Newcomer',
       type: 'villager',
+      // A God-spawned newcomer joins the village whose ground it appears on.
+      villageId: this.villageIdNear(ix, iy),
       position: { x: ix, y: iy },
       target: null,
       color,
@@ -1788,10 +2388,161 @@ export class WorldEngine {
       backpack: [],
       task: null,
       asleep: false,
+      life: VILLAGER_MAX_LIFE,
+      maxLife: VILLAGER_MAX_LIFE,
+      downed: false,
     };
     this.entities.set(villager.id, villager);
+    // A newcomer takes a spare house if one stands empty; otherwise it waits homeless
+    // until the village raises one for it (the house build gate sees the shortfall).
+    this.reconcileHomes();
     console.log(`[engine] God spawned ${villager.id} at (${ix}, ${iy})`);
     // No init needed: the next tick's state update already includes this villager.
+  }
+
+  /**
+   * Place a FORTIFICATION the god has called for (v3 war). A `wall` or `gate` lays as
+   * a LINE of single-tile segments from (x, y) along {@link orientation} for `length`
+   * tiles; a wall line longer than two auto-opens one gate near its middle so the ring
+   * it forms is actually enterable. The muster buildings (watchtower / barracks /
+   * war_camp / siege_ram) place as a single footprint. Every piece carries the kind's
+   * full {@link buildingMaxLife} and is owned by whichever village it is raised beside.
+   * Re-announces the static world so observers pick up the new structures at once.
+   */
+  private placeFortification(
+    kind: BuildingKind,
+    x: number,
+    y: number,
+    length?: number,
+    orientation?: 'h' | 'v',
+  ): void {
+    const villageId = this.villageIdNear(Math.round(x), Math.round(y));
+    let placed = 0;
+
+    if (isWall(kind) || isGate(kind)) {
+      // A line of segments. A bare gate call (length<=1) drops a single gate; a wall
+      // line auto-inserts a gate near the middle so the rampart can be passed.
+      const len = Math.max(1, Math.min(60, Math.round(length ?? 1)));
+      const horizontal = (orientation ?? 'h') === 'h';
+      const gateAt = isWall(kind) && len > 2 ? Math.floor(len / 2) : -1;
+      for (let i = 0; i < len; i++) {
+        const tx = Math.round(x) + (horizontal ? i : 0);
+        const ty = Math.round(y) + (horizontal ? 0 : i);
+        const segKind: BuildingKind = i === gateAt ? 'gate' : kind;
+        if (this.placeFortPiece(segKind, tx, ty, villageId)) placed += 1;
+      }
+    } else {
+      // A single footprint building (watchtower / barracks / war_camp / siege_ram).
+      const { width, height } = fortFootprint(kind);
+      const at = this.nearestFreeRect(Math.round(x), Math.round(y), width, height);
+      if (at && this.placeFortPiece(kind, at.x, at.y, villageId)) placed += 1;
+    }
+
+    if (placed > 0) {
+      console.log(`[engine] God raised ${placed} ${kind} piece(s) for ${villageId}`);
+      this.emit('init', this.getInitMessage());
+    } else {
+      console.warn(`[engine] fortify: no room to place ${kind} near (${x}, ${y}) — ignored`);
+    }
+  }
+
+  /**
+   * Drop ONE fortification piece on a tile if the ground is free, registering it as a
+   * live building, reserving its footprint (a gate stays walkable), and seeding its
+   * health. Returns true when a piece was placed.
+   */
+  private placeFortPiece(kind: BuildingKind, x: number, y: number, villageId: string): boolean {
+    const { width, height } = fortFootprint(kind);
+    // Every footprint tile must be in-bounds and free (a gate may sit on free ground too).
+    for (let yy = y; yy < y + height; yy++) {
+      for (let xx = x; xx < x + width; xx++) {
+        if (xx < 0 || yy < 0 || xx >= this.width || yy >= this.height) return false;
+        if (this.staticOccupancy[yy * this.width + xx] !== 0) return false;
+        if (this.buildingAt(xx, yy)) return false;
+      }
+    }
+    this.spawnSeq += 1;
+    const maxLife = buildingMaxLife(kind);
+    const id = `fort_${kind}_${this.spawnSeq}`;
+    const building: Building = {
+      id,
+      type: 'building',
+      kind,
+      villageId,
+      name: this.fortName(kind),
+      function: BUILDING_FUNCTIONS[kind],
+      position: { x, y },
+      width,
+      height,
+      color: BUILDING_COLORS[kind],
+      stock: {},
+      capacity: BUILDING_CAPACITY,
+      life: maxLife,
+      maxLife,
+      ...(isGate(kind) ? { open: true } : {}),
+    };
+    this.entities.set(id, building);
+    // A gate is the one piece that stays WALKABLE; everything else reserves its ground.
+    if (!isGate(kind)) {
+      this.markStaticRect(x, y, width, height);
+      // A fresh wall changes the map's walkability: drop every cached route so bodies
+      // re-plan around it rather than walking a stale path through where it now stands.
+      this.paths.clear();
+    }
+    return true;
+  }
+
+  /** A human name for a freshly raised fortification piece. */
+  private fortName(kind: BuildingKind): string {
+    switch (kind) {
+      case 'wall': return 'Wall';
+      case 'gate': return 'Gate';
+      case 'watchtower': return 'Watchtower';
+      case 'barracks': return 'Barracks';
+      case 'war_camp': return 'War Camp';
+      case 'siege_ram': return 'Siege Ram';
+      default: return kind;
+    }
+  }
+
+  /**
+   * The id of the village that owns the ground at (x, y) — the village of the nearest
+   * building, so a god fortifies near its OWN settlement and the wall reads as that
+   * side's. Falls back to the home village when no building is near.
+   */
+  private villageIdNear(x: number, y: number): string {
+    let best: { id: string; d: number } | null = null;
+    for (const b of this.buildings()) {
+      const d = this.rectDistance({ x, y }, b);
+      if (best === null || d < best.d) best = { id: b.villageId ?? DEFAULT_VILLAGE_ID, d };
+    }
+    return best?.id ?? DEFAULT_VILLAGE_ID;
+  }
+
+  /**
+   * Find the top-left of a free width×height rectangle near (x, y) — a spiral outward
+   * from the wanted tile, mirroring {@link nearestFreeTile} but for a footprint. Null
+   * if nowhere clear was found within the search ring.
+   */
+  private nearestFreeRect(x: number, y: number, w: number, h: number): { x: number; y: number } | null {
+    const fits = (x0: number, y0: number): boolean => {
+      for (let yy = y0; yy < y0 + h; yy++) {
+        for (let xx = x0; xx < x0 + w; xx++) {
+          if (xx < 0 || yy < 0 || xx >= this.width || yy >= this.height) return false;
+          if (this.staticOccupancy[yy * this.width + xx] !== 0) return false;
+        }
+      }
+      return true;
+    };
+    for (let r = 0; r <= 20; r++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          if (fits(x + dx, y + dy)) return { x: x + dx, y: y + dy };
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -1860,6 +2611,8 @@ export class WorldEngine {
       ...(this.theme ? { theme: this.theme } : {}),
       ...(this.setting ? { setting: this.setting } : {}),
       ...(this.palette ? { palette: this.palette } : {}),
+      ...(this.rivalPalette ? { rivalPalette: this.rivalPalette } : {}),
+      ...(this.paletteSplitX !== undefined ? { paletteSplitX: this.paletteSplitX } : {}),
     };
   }
 
@@ -1882,10 +2635,19 @@ export class WorldEngine {
   private buildingStocks(): BuildingStock[] {
     const out: BuildingStock[] = [];
     for (const b of this.buildings()) {
-      // Construction sites stream their gathered MATERIALS (held in `stock`) so the
-      // progress shows live, even though they have no static stock-kind table.
-      if (buildingStockKinds(b.kind).length === 0 && !isConstructionSite(b.kind)) continue;
-      out.push({ id: b.id, stock: { ...b.stock } });
+      const max = b.maxLife ?? buildingMaxLife(b.kind);
+      const damaged = typeof b.life === 'number' && b.life < max;
+      const isFort = isFortification(b.kind);
+      // Stream a building's live state when it has an economy (stock), is a building
+      // site (materials), is a fortification (gate/siege state), or has taken damage.
+      if (buildingStockKinds(b.kind).length === 0 && !isConstructionSite(b.kind) && !isFort && !damaged) continue;
+      out.push({
+        id: b.id,
+        stock: { ...b.stock },
+        ...(typeof b.life === 'number' ? { life: b.life } : {}),
+        ...(b.open !== undefined ? { open: b.open } : {}),
+        ...(b.siegeProgress !== undefined ? { siegeProgress: b.siegeProgress } : {}),
+      });
     }
     return out;
   }
@@ -1983,6 +2745,8 @@ export class WorldEngine {
       ...(this.theme ? { theme: this.theme } : {}),
       ...(this.setting ? { setting: this.setting } : {}),
       ...(this.palette ? { palette: this.palette } : {}),
+      ...(this.rivalPalette ? { rivalPalette: this.rivalPalette } : {}),
+      ...(this.paletteSplitX !== undefined ? { paletteSplitX: this.paletteSplitX } : {}),
       // Transient state, so a restart resumes weather/sleep/work/notices in place.
       weather: this.weather,
       spawnSeq: this.spawnSeq,
@@ -2122,6 +2886,11 @@ export class WorldEngine {
       // A villager resumed from a save wakes for the new session; the in-memory
       // wake schedule doesn't survive a restart, so never start a body mid-sleep.
       asleep: false,
+      // Health (v3 war). A save predating life starts whole; a resumed villager always
+      // rejoins on its feet (never mid-down), like it never resumes mid-sleep.
+      life: typeof v.life === 'number' ? clampLife(v.life, VILLAGER_MAX_LIFE) : VILLAGER_MAX_LIFE,
+      maxLife: v.maxLife ?? VILLAGER_MAX_LIFE,
+      downed: false,
     };
   }
 
@@ -2160,6 +2929,8 @@ export class WorldEngine {
     const capacity = b.capacity ?? BUILDING_CAPACITY;
     // A construction site is mid-project: keep the materials hauled in so far and the
     // project record exactly, rather than defaulting an empty larder to full.
+    const maxLife = b.maxLife ?? buildingMaxLife(b.kind);
+    const life = typeof b.life === 'number' ? clampLife(b.life, maxLife) : maxLife;
     if (isConstructionSite(b.kind) && b.construction) {
       return {
         ...b,
@@ -2167,13 +2938,17 @@ export class WorldEngine {
         capacity,
         stock: { ...(b.stock ?? {}) },
         construction: { ...b.construction, required: { ...b.construction.required } },
+        life,
+        maxLife,
       };
     }
     const stock: Partial<Record<ResourceKind, number>> = {};
     for (const resource of buildingStockKinds(b.kind)) {
       stock[resource] = b.stock?.[resource] ?? capacity;
     }
-    return { ...b, position: { ...b.position }, capacity, stock };
+    // A resumed gate starts OPEN (unheld); the war step re-derives whether a defender
+    // is barring it each round.
+    return { ...b, position: { ...b.position }, capacity, stock, life, maxLife, ...(isGate(b.kind) ? { open: b.open ?? true } : {}) };
   }
 
   /** Live carts as a typed array. */

@@ -39,6 +39,11 @@ import {
   type SimTickEvent,
   type SupervisorCommandEvent,
   type SupervisorDailyReportEvent,
+  type VillageScoreEvent,
+  type VillageDailySummaryEvent,
+  type VillagePulseEvent,
+  type VillageAlertEvent,
+  type VillageDailySummaryPayload,
   type VillagerAgendaEvent,
   type VillagerAgendaRemovedEvent,
   type VillagerConversationEvent,
@@ -53,14 +58,20 @@ import { makeEvent } from '../../bus/EventBus';
 import {
   isEffortPurpose,
   isReasoningEffort,
+  isResourceKind,
+  DEFAULT_VILLAGE_ID,
   type BrowserCommand,
+  type BuildingKind,
+  type ResourceKind,
   type ServerMessage,
+  type VillageCensus,
   type WeatherKind,
   type WorldInitMessage,
   type WorldGeneratingMessage,
   type WorldNeedsSetupMessage,
   type WorldStateUpdate,
 } from '../../shared/types';
+import { isFortification } from '../../shared/fortifications';
 
 /** The weather states a browser may set (the closed vocabulary the gateway trusts). */
 const WEATHERS: readonly WeatherKind[] = ['clear', 'rain', 'storm', 'fog', 'heatwave'];
@@ -159,6 +170,18 @@ export class IngressGateway {
   /** Latest chat-model config, replayed so the Settings window's model picker opens in sync. */
   private lastModel: ServerMessage | null = null;
   private lastPool: ServerMessage | null = null;
+  /** Latest village competition scoreboard, replayed so the HUD chip opens populated. */
+  private lastScore: ServerMessage | null = null;
+  /**
+   * Latest per-village CENSUS, accumulated from the per-village digests the aggregator
+   * emits (one pulse/summary per village, possibly staggered), so the merged snapshot
+   * is broadcast and replayed on connect. Keyed by villageId.
+   */
+  private readonly census = new Map<string, VillageCensus>();
+  /** The last census message broadcast, replayed on connect so standings open populated. */
+  private lastCensus: ServerMessage | null = null;
+  /** A short ring buffer of recent world alerts (raids etc.), replayed so the ticker isn't blank. */
+  private readonly recentAlerts: ServerMessage[] = [];
 
   constructor(
     private readonly bus: EventBus,
@@ -320,6 +343,7 @@ export class IngressGateway {
           villagerName: this.villagerName(villagerId),
           message,
           tick: this.lastState?.tick ?? 0,
+          villageId: this.villageIdOf(villagerId),
         });
       },
     );
@@ -331,7 +355,14 @@ export class IngressGateway {
       'supervisor.*',
       (event) => {
         const act = this.describeSupervisorAction(event);
-        if (act) this.broadcast({ kind: 'supervisor.action', action: act.action, summary: act.summary });
+        if (act) {
+          this.broadcast({
+            kind: 'supervisor.action',
+            action: act.action,
+            summary: act.summary,
+            villageId: act.villageId,
+          });
+        }
       },
     );
 
@@ -341,6 +372,50 @@ export class IngressGateway {
       EXCHANGES.villageEvents,
       'village.daily_report',
       (event) => this.broadcast({ kind: 'supervisor.daily_report', report: event.payload }),
+    );
+
+    // DOWN: the village COMPETITION SCOREBOARD. Cache the latest for replay on connect
+    // (so the HUD chip + supervisor panel open already populated) and push every update.
+    await this.bus.subscribe<VillageScoreEvent>(
+      EXCHANGES.villageEvents,
+      'village.score',
+      (event) => {
+        this.lastScore = { kind: 'village.score', scoreboard: event.payload };
+        this.broadcast(this.lastScore);
+      },
+    );
+
+    // DOWN: per-village CENSUS. The aggregator already emits a per-village digest on both
+    // `village.daily_summary` and the between-days `village.pulse` heartbeat; fold each into
+    // a concrete census (population / stored resources / structures / forts) so a multi-village
+    // UI can show real vitals beside the abstract score. Accumulate per village and broadcast
+    // the merged snapshot, so a staggered pulse never ships a half-empty board.
+    await this.bus.subscribe<VillagePulseEvent>(
+      EXCHANGES.villageEvents,
+      'village.pulse',
+      (event) => this.ingestCensus(event.payload),
+    );
+    await this.bus.subscribe<VillageDailySummaryEvent>(
+      EXCHANGES.villageEvents,
+      'village.daily_summary',
+      (event) => this.ingestCensus(event.payload),
+    );
+
+    // DOWN: world ALERTS (raids, famines, surpluses, …) tagged by village, so the UI can
+    // raise a per-village ticker. Keep a short replay buffer so a fresh connection isn't blank.
+    await this.bus.subscribe<VillageAlertEvent>(
+      EXCHANGES.villageEvents,
+      'village.alert',
+      (event) => {
+        const msg: ServerMessage = {
+          kind: 'village.alert',
+          villageId: event.payload.villageId ?? DEFAULT_VILLAGE_ID,
+          event: event.payload,
+        };
+        this.recentAlerts.push(msg);
+        while (this.recentAlerts.length > 20) this.recentAlerts.shift();
+        this.broadcast(msg);
+      },
     );
 
     this.wss.on('connection', (socket) => this.handleConnection(socket));
@@ -562,7 +637,7 @@ export class IngressGateway {
         return;
       }
       case 'world.init': {
-        const { width, height, tickRate, trees, buildings, weather, theme, setting, palette } = event.payload;
+        const { width, height, tickRate, trees, buildings, weather, theme, setting, palette, rivalPalette, paletteSplitX } = event.payload;
         this.lastInit = {
           kind: 'world.init',
           width,
@@ -574,6 +649,8 @@ export class IngressGateway {
           ...(theme ? { theme } : {}),
           ...(setting ? { setting } : {}),
           ...(palette ? { palette } : {}),
+          ...(rivalPalette ? { rivalPalette } : {}),
+          ...(paletteSplitX !== undefined ? { paletteSplitX } : {}),
         };
         // The world now exists: a later-connecting browser must not see a stale
         // "generating" overlay or setup prompt, so drop both.
@@ -631,6 +708,12 @@ export class IngressGateway {
     if (this.lastModel) this.send(socket, this.lastModel);
     // The current pool shape, so the LLM-engine window shows endpoints immediately.
     if (this.lastPool) this.send(socket, this.lastPool);
+    // The current scoreboard, so the competition HUD chip opens already populated.
+    if (this.lastScore) this.send(socket, this.lastScore);
+    // The current per-village census, so standings open with real vitals (pop/resources/forts).
+    if (this.lastCensus) this.send(socket, this.lastCensus);
+    // Recent world alerts (raids etc.), so the ticker isn't blank on a fresh connection.
+    for (const alert of this.recentAlerts) this.send(socket, alert);
 
     socket.on('message', (raw) => this.handleMessage(raw.toString()));
     socket.on('close', () => console.log('[gateway] browser disconnected'));
@@ -675,38 +758,50 @@ export class IngressGateway {
       }
       case 'supervisor_verdict': {
         // The temple console's per-prayer verdict — a multi-word key only the
-        // Supervisor (binding `user.supervisor.*`) receives.
-        const { prayerId, villagerId, villagerName, message, verdict } = command;
+        // Supervisor (binding `user.supervisor.*`) receives. `villageId` routes it to
+        // the addressed village's god in a multi-village world (absent ⇒ default).
+        const { prayerId, villagerId, villagerName, message, verdict, villageId } = command;
         this.bus.publish(
           EXCHANGES.userCommands,
-          makeEvent('user.supervisor.verdict', { prayerId, villagerId, villagerName, message, verdict }),
+          makeEvent('user.supervisor.verdict', { prayerId, villagerId, villagerName, message, verdict, villageId }),
         );
         return;
       }
       case 'supervisor_force_run': {
-        this.bus.publish(EXCHANGES.userCommands, makeEvent('user.supervisor.force_run', {}));
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.supervisor.force_run', { villageId: command.villageId }),
+        );
+        return;
+      }
+      case 'supervisor_pause': {
+        // Human override: pause/resume the autonomous god (multi-word key → only the Supervisor).
+        this.bus.publish(
+          EXCHANGES.userCommands,
+          makeEvent('user.supervisor.pause', { paused: command.paused, villageId: command.villageId }),
+        );
         return;
       }
       case 'god_set_weather': {
         // A human "Divine Power": relayed straight to the engine (single-word key).
         this.bus.publish(EXCHANGES.userCommands, makeEvent('user.set_weather', { weather: command.weather }));
-        this.broadcast({ kind: 'supervisor.action', action: 'change_weather', summary: `you turned the weather to ${command.weather}` });
+        this.broadcast({ kind: 'supervisor.action', action: 'change_weather', summary: `you turned the weather to ${command.weather}`, villageId: DEFAULT_VILLAGE_ID });
         return;
       }
       case 'god_spawn': {
         const { entityType, x, y } = command;
         this.bus.publish(EXCHANGES.userCommands, makeEvent('user.spawn_entity', { entityType, x, y }));
-        this.broadcast({ kind: 'supervisor.action', action: 'spawn_entity', summary: `you conjured a ${entityType}` });
+        this.broadcast({ kind: 'supervisor.action', action: 'spawn_entity', summary: `you conjured a ${entityType}`, villageId: DEFAULT_VILLAGE_ID });
         return;
       }
       case 'god_bless': {
         this.bus.publish(EXCHANGES.userCommands, makeEvent('user.bless', { villagerId: command.targetId }));
-        this.broadcast({ kind: 'supervisor.action', action: 'bless', summary: `you blessed ${this.villagerName(command.targetId)}` });
+        this.broadcast({ kind: 'supervisor.action', action: 'bless', summary: `you blessed ${this.villagerName(command.targetId)}`, villageId: this.villageIdOf(command.targetId) });
         return;
       }
       case 'god_smite': {
         this.bus.publish(EXCHANGES.userCommands, makeEvent('user.smite', { villagerId: command.targetId }));
-        this.broadcast({ kind: 'supervisor.action', action: 'smite', summary: `you smote ${this.villagerName(command.targetId)}` });
+        this.broadcast({ kind: 'supervisor.action', action: 'smite', summary: `you smote ${this.villagerName(command.targetId)}`, villageId: this.villageIdOf(command.targetId) });
         return;
       }
       case 'set_reasoning_effort': {
@@ -770,22 +865,86 @@ export class IngressGateway {
     return this.lastState?.villagers.find((v) => v.id === id)?.name ?? id;
   }
 
-  /** One-line gloss of a supervisor command for the console's "divine acts" log. */
+  /** Which village a villager belongs to (from the cached state), defaulting to the
+   *  single-village id when unknown or untagged (v3 rival-village seam). */
+  private villageIdOf(id: string): string {
+    return this.lastState?.villagers.find((v) => v.id === id)?.villageId ?? DEFAULT_VILLAGE_ID;
+  }
+
+  /**
+   * Fold one village's daily/pulse digest into its {@link VillageCensus}, store it, and
+   * broadcast the merged board across every village seen so far. Pulses/summaries arrive
+   * one village at a time and possibly staggered, so we accumulate rather than replace the
+   * whole board — a quiet village keeps its last census until its next pulse.
+   */
+  private ingestCensus(payload: VillageDailySummaryPayload): void {
+    const villageId = payload.villageId ?? DEFAULT_VILLAGE_ID;
+    const digest = payload.digest;
+    const resources: Partial<Record<ResourceKind, number>> = {};
+    if (digest) {
+      for (const [k, v] of Object.entries(digest.stocks)) {
+        if (isResourceKind(k) && typeof v === 'number') resources[k] = v;
+      }
+    }
+    const structures = (digest?.buildings ?? []).map((b) => ({ kind: b.kind, count: b.count }));
+    const fortCount = (digest?.buildings ?? []).reduce(
+      (sum, b) => sum + (isFortification(b.kind as BuildingKind) ? b.count : 0),
+      0,
+    );
+    this.census.set(villageId, { villageId, population: payload.population, resources, structures, fortCount });
+
+    const message: ServerMessage = {
+      kind: 'village.census',
+      day: payload.day,
+      tick: payload.tick,
+      villages: [...this.census.values()],
+    };
+    this.lastCensus = message;
+    this.broadcast(message);
+  }
+
+  /** One-line gloss of a supervisor command for the console's "divine acts" log,
+   *  tagged with the village whose god took it (v3 rival seam). */
   private describeSupervisorAction(
     event: SupervisorCommandEvent,
-  ): { action: string; summary: string } | null {
+  ): { action: string; summary: string; villageId: string } | null {
     switch (event.type) {
       case 'supervisor.spawn_entity':
         return {
           action: 'spawn_entity',
           summary: `spawned a ${event.payload.entityType} at (${event.payload.x}, ${event.payload.y})`,
+          villageId: DEFAULT_VILLAGE_ID,
         };
       case 'supervisor.change_weather':
-        return { action: 'change_weather', summary: `turned the weather to ${event.payload.weather}` };
+        return {
+          action: 'change_weather',
+          summary: `turned the weather to ${event.payload.weather}`,
+          villageId: DEFAULT_VILLAGE_ID,
+        };
       case 'supervisor.plant_idea':
         return {
           action: 'plant_idea',
           summary: `whispered to ${this.villagerName(event.payload.villagerId)}: "${event.payload.memory}"`,
+          villageId: this.villageIdOf(event.payload.villagerId),
+        };
+      case 'supervisor.set_priorities': {
+        // The standing POLICY — the most telling per-village act: what the god is steering.
+        const top = Object.entries(event.payload.weights)
+          .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+          .slice(0, 3)
+          .map(([k, v]) => `${k} ${Math.round((v ?? 0) * 100)}%`)
+          .join(', ');
+        return {
+          action: 'set_priorities',
+          summary: top ? `set priorities — ${top}` : 'reset priorities to neutral',
+          villageId: event.payload.villageId ?? DEFAULT_VILLAGE_ID,
+        };
+      }
+      case 'supervisor.issue_order':
+        return {
+          action: 'issue_order',
+          summary: `ordered ${event.payload.task}${event.payload.rationale ? ` — ${event.payload.rationale}` : ''}`,
+          villageId: event.payload.villageId ?? DEFAULT_VILLAGE_ID,
         };
       default:
         return null;
@@ -831,10 +990,21 @@ export class IngressGateway {
         villagerName: typeof obj.villagerName === 'string' ? obj.villagerName : obj.villagerId,
         message: obj.message,
         verdict: obj.verdict,
+        ...(typeof obj.villageId === 'string' ? { villageId: obj.villageId } : {}),
       };
     }
     if (obj.command === 'supervisor_force_run') {
-      return { command: 'supervisor_force_run' };
+      return {
+        command: 'supervisor_force_run',
+        ...(typeof obj.villageId === 'string' ? { villageId: obj.villageId } : {}),
+      };
+    }
+    if (obj.command === 'supervisor_pause' && typeof obj.paused === 'boolean') {
+      return {
+        command: 'supervisor_pause',
+        paused: obj.paused,
+        ...(typeof obj.villageId === 'string' ? { villageId: obj.villageId } : {}),
+      };
     }
     if (
       obj.command === 'god_set_weather' &&

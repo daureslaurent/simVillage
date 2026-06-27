@@ -12,7 +12,25 @@
  */
 
 import type { DivineAct, VillageDailySummaryPayload, VillageVision } from '../../shared/events';
-import type { VillageMilestone, VillagePillar } from '../../shared/types';
+import type { CompetitionIntensity, DigestEvent, VillageMilestone, VillagePillar, VillagePolicy, WorldDigestVitals } from '../../shared/types';
+import { PRIORITIES } from '../../shared/types';
+
+/**
+ * The RAID STANCE line folded into the charter for each competition intensity — a soft
+ * nudge on how readily this god sends a raiding party against the rival across the valley.
+ * Only meaningful in a two-village world; harmless otherwise (there is no one to raid).
+ */
+const INTENSITY_STANCE: Record<CompetitionIntensity, string> = {
+  peaceful:
+    'Your stance toward the rival village is PEACEFUL: prefer to out-build and out-grow them, ' +
+    'not raid them. Raid only as a last resort when your people are truly desperate.',
+  balanced:
+    'Your stance toward the rival village is BALANCED: raid when there is a clear advantage or ' +
+    'a wrong to answer, but do not seek conflict for its own sake.',
+  aggressive:
+    'Your stance toward the rival village is AGGRESSIVE: press them hard — raid often to seize ' +
+    'their stores and keep them on the back foot, while still keeping your own people alive.',
+};
 
 /** The default standing directive, used when no SUPERVISOR_CHARTER is given. */
 export const DEFAULT_CHARTER =
@@ -24,36 +42,114 @@ export const DEFAULT_CHARTER =
  * villager system prompt — it states the role and when to act, and leaves the
  * exact tool JSON to the schemas passed separately.
  */
-export function buildCharterPrompt(charter: string = DEFAULT_CHARTER): string {
+export function buildCharterPrompt(charter: string = DEFAULT_CHARTER, intensity?: CompetitionIntensity): string {
   return [
     'You are the unseen Supervisor — the god — of an autonomous simulated village.',
-    'You never appear in the world; you shape it from above, one day at a time.',
+    'You never appear in the world; you shape it from above.',
     '',
     `Your charter: ${charter}`,
+    ...(intensity ? ['', INTENSITY_STANCE[intensity]] : []),
     '',
-    'Each day you are given the village vitals. Judge whether the village needs a',
-    'CHALLENGE (adversity to react to), a REWARD (relief or opportunity), or',
-    'nothing at all. Then take at most one action by calling one tool:',
-    '- spawn_entity: add a tree (terrain/obstacle) or a villager (a newcomer).',
+    'You are an AGENT. Work in a loop: THINK about what the vitals in front of you mean,',
+    'INVESTIGATE with your lookup tools to gather the facts you are missing, reason about',
+    'what you find, and only THEN act. Looking costs nothing; acting is weighty. Never steer',
+    'blind — when something is unclear (who is suffering? where are the stores? what did I try',
+    'before?), look it up first. When you have seen enough, take at most one or two actions,',
+    'then stop (call no tool) to end your deliberation.',
+    '',
+    'INVESTIGATION tools (read-only — they change nothing, they inform you):',
+    '- list_villagers: every villager now, with needs + what they are doing (find the suffering).',
+    '- inspect_villager(villager_id): one villager in full, before you whisper to or single them out.',
+    '- list_buildings(kind?): the structures and their current stock (see where stores really sit).',
+    '- scan_rival: the rival across the valley, as far as the fog allows (before you raid).',
+    '- review_plan: your village\'s stage, milestones, and the priorities you are already steering with.',
+    '- list_prayers: every petition still awaiting your judgement.',
+    '- recall_memory(query): what you have learned about this village before.',
+    '',
+    'ACTION tools (these shape the world — use deliberately):',
+    '- set_priorities: your MAIN, everyday lever — the standing weights (0..1) that bias what',
+    '  the whole village spends effort on (food, water, build, gather, recreation…). Low stores',
+    '  → raise food/gather; a growing settlement → raise build; restless people → raise recreation.',
+    '- issue_order: a TARGETED, temporary push — send specific villagers (or everyone) to a task',
+    '  (build, gather, haul, work, guard, move, socialize) for a while. It expires; villagers still',
+    '  tend their own survival. Use it for a focused, short-lived effort.',
+    '- spawn_entity: add a tree, a villager newcomer, OR a FORTIFICATION to wage the war on',
+    '  your rival. On your OWN ground raise "wall" (give `length` + `orientation` "h"/"v" to lay',
+    '  a rampart; a long wall opens a "gate" in its middle so your folk pass), "watchtower" (spot',
+    '  raids early), "barracks" (your defenders fight harder), "war_camp" (your raiders hit',
+    '  harder) — and place a "siege_ram" against a RIVAL wall to batter a breach. Buildings and',
+    '  villagers carry life; ring your settlement with walls to blunt raids, then breach theirs.',
     '- change_weather: set the mood and pressure across the whole village.',
     '- plant_idea: implant a belief or rumour into one villager to steer a story.',
     '',
-    'Restraint is a virtue: most days, the right move is to do nothing and let the',
-    'villagers live. Intervene only when the vitals show stagnation or distress.',
-    'When villagers pray to you at the temple, weigh their petitions — they are your',
-    'people asking to be heard — though you answer in your own way, never directly.',
-    'If you choose to act, pick the single most fitting tool.',
+    'Most deliberations end in a single set_priorities tuned to fit what you saw — that alone',
+    'steers the village. The other three action tools are DRAMA: use them sparingly, only when',
+    'the situation shows stagnation or distress that a shift in priorities cannot answer. When',
+    'villagers pray to you, weigh their petitions — your people asking to be heard — though you',
+    'answer in your own way, never directly.',
   ].join('\n');
 }
 
-/** Render one day's vitals as the prose the god reasons over. */
-export function buildSummaryMessage(s: VillageDailySummaryPayload): string {
+/** How the god is told to act this day (drama gated by the intervention cool-off). */
+export interface SummaryContext {
+  /** The village's current standing policy, so the god tunes from where it is. */
+  policy?: VillagePolicy;
+  /** False while the god is cooling off from a recent dramatic act — only policy may change. */
+  dramaAllowed?: boolean;
+}
+
+/** One line of the village's current standing priorities, or a note that none are set. */
+function formatPolicy(policy?: VillagePolicy): string {
+  const w = policy?.weights ?? {};
+  const set = PRIORITIES.filter((p) => w[p] !== undefined);
+  if (set.length === 0) return 'Current priorities: none set yet (the village runs neutral).';
+  return 'Current priorities: ' + set.map((p) => `${p} ${w[p]!.toFixed(2)}`).join(', ') + '.';
+}
+
+/** Render the aggregate WORLD DIGEST vitals (needs/stocks/buildings) as prose for the god. */
+function formatDigest(d?: WorldDigestVitals): string[] {
+  if (!d) return [];
+  const lines = ['', 'Village vitals (averaged across your people):'];
+  lines.push(
+    `- Needs (avg/worst, 0 calm…100 dire): hunger ${d.needs.hunger.avg}/${d.needs.hunger.max}, ` +
+      `thirst ${d.needs.thirst.avg}/${d.needs.thirst.max}, fatigue ${d.needs.fatigue.avg}/${d.needs.fatigue.max}, ` +
+      `boredom ${d.needs.boredom.avg}/${d.needs.boredom.max}.`,
+  );
+  // Fatigue is SELF-MANAGED: villagers sleep on their own when it nears 100, so it needs no
+  // steering. Don't gut build/gather to chase rest — keep weighting work by what the village
+  // is actually short of (food/water low → raise those; stores deep → raise build/gather).
+  lines.push('  (Fatigue resolves itself in sleep — do not zero out work to "rest"; steer by stocks.)');
+  const stocks = Object.entries(d.stocks).map(([r, n]) => `${r} ${n}`);
+  lines.push(`- Stores: ${stocks.length > 0 ? stocks.join(', ') : 'empty'}.`);
+  const low = d.buildings.filter((b) => b.lowStock > 0).map((b) => `${b.lowStock}× ${b.kind}`);
+  if (low.length > 0) lines.push(`- Running low: ${low.join(', ')}.`);
+  // v3 P5 (design §10) — what you can see of the RIVAL across the valley (fog-of-war): their
+  // rough size + where their settlement lies. You may send a raiding party with
+  // issue_order task "raid" and x/y set to their location to seize their stores.
+  if (d.rival) {
+    const where = d.rival.center ? ` near (${d.rival.center.x}, ${d.rival.center.y})` : '';
+    lines.push(
+      `- Rival "${d.rival.villageId}": ${d.rival.activity}${where}. ` +
+        `To raid them, issue_order task "raid" with x/y set to their location.`,
+    );
+  }
+  return lines;
+}
+
+/** Render one day's vitals + the standing policy as the prose the god reasons over. */
+export function buildSummaryMessage(s: VillageDailySummaryPayload, ctx: SummaryContext = {}): string {
   const lines = [
     `Day ${s.day} has ended (tick ${s.tick}).`,
     `Population: ${s.population} villager(s). Weather: ${s.weather}.`,
     `Today there were ${s.conversations} conversation(s) and ${s.movements} movement(s).`,
     `${s.idleVillagers} villager(s) did nothing at all today.`,
+    formatPolicy(ctx.policy),
   ];
+  lines.push(...formatDigest(s.digest));
+  if (s.events && s.events.length > 0) {
+    lines.push('', 'Notable happenings today:');
+    for (const e of s.events) lines.push(`- ${digestEventIcon(e.salience)} ${e.text}`);
+  }
   if (s.notableQuotes && s.notableQuotes.length > 0) {
     lines.push('', 'Overheard today:');
     for (const q of s.notableQuotes) lines.push(`- "${q}"`);
@@ -62,7 +158,20 @@ export function buildSummaryMessage(s: VillageDailySummaryPayload): string {
     lines.push('', 'Prayers offered to you at the temple today:');
     for (const p of s.notablePrayers) lines.push(`- "${p}"`);
   }
-  lines.push('', 'Decide whether to intervene, and if so call exactly one tool.');
+  lines.push('');
+  if (ctx.dramaAllowed === false) {
+    lines.push(
+      'You acted dramatically recently and are still at rest — today you may ONLY call',
+      'set_priorities to tune the village. Adjust the weights to fit these vitals (or, if',
+      'they are already right, call no tool).',
+    );
+  } else {
+    lines.push(
+      'Tune the priorities to fit these vitals with set_priorities, and only stage drama',
+      '(spawn_entity / change_weather / plant_idea) if something truly warrants it. Call the',
+      'one tool that fits — or none if the village is well and the priorities already suit.',
+    );
+  }
   return lines.join('\n');
 }
 
@@ -245,6 +354,129 @@ export function parseVisionAssessment(text: string): VisionAssessment {
     }
   }
   return out;
+}
+
+/** A small severity marker for a world event, so the prompt reads the urgency at a glance. */
+function digestEventIcon(salience: DigestEvent['salience']): string {
+  return salience === 'crisis' ? '‼' : salience === 'warning' ? '!' : '·';
+}
+
+/**
+ * Render a HIGH-SALIENCE alert into the prompt for an out-of-cadence deliberation
+ * (design §8). The god is woken mid-day by a crisis; give it the crisis itself, the
+ * last day's vitals/policy for context, and a tight instruction to answer THIS — with a
+ * priority shift, or drama if it truly warrants. Falls back to the bare alert when no
+ * summary has been seen yet (very early in a run).
+ */
+export function buildAlertMessage(
+  event: DigestEvent,
+  lastSummary: VillageDailySummaryPayload | undefined,
+  ctx: SummaryContext = {},
+): string {
+  const lines = [
+    `A crisis stirs the village mid-day: ${event.text}`,
+    '',
+  ];
+  if (lastSummary) {
+    lines.push('Where things stood at last reckoning:', formatPolicy(ctx.policy), ...formatDigest(lastSummary.digest), '');
+  }
+  lines.push(
+    'Answer this now. Shift the standing priorities with set_priorities to meet it, and',
+    'stage drama (spawn_entity / change_weather / plant_idea) only if a shift cannot. Call',
+    'the one tool that fits — or none if the village will weather it unaided.',
+  );
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// v3 P4 — the god's LONG-TERM MEMORY: recall past days + distil a strategy
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the god's recalled experience as a block to prepend to a deliberation. It
+ * leads with the standing STRATEGIC LESSON (the through-line the god carries day to
+ * day), then the most similar PAST DAYS — so the macro-mind reasons from what has
+ * worked here before, not just the day in front of it. Empty string when the god has
+ * no memories yet (a fresh village), so the prompt reads exactly as it did pre-P4.
+ */
+export function buildSupervisorMemoryBlock(
+  recalled: { text: string }[],
+  strategy: string | null,
+): string {
+  if (!strategy && recalled.length === 0) return '';
+  const lines = ['From your long memory of this village:'];
+  if (strategy) lines.push(`- Your standing lesson: ${strategy}`);
+  if (recalled.length > 0) {
+    lines.push('- Days like this one, and what you did:');
+    for (const r of recalled) lines.push(`    · ${r.text}`);
+  }
+  lines.push('Weigh this experience, but judge today on its own vitals below.', '');
+  return lines.join('\n');
+}
+
+/**
+ * Narrate one day's deliberation for storage in long-term memory: the situation the
+ * god faced (the day's vitals + policy) and what it decided (the acts it took). Kept
+ * compact and factual — this is the episodic record a future day recalls by similarity.
+ */
+export function buildDeliberationRecord(
+  s: VillageDailySummaryPayload,
+  acts: DivineAct[],
+  policy?: VillagePolicy,
+): string {
+  const lines = [`Day ${s.day} (${s.weather}):`];
+  const d = s.digest;
+  if (d) {
+    lines.push(
+      `needs hunger ${d.needs.hunger.avg}/${d.needs.hunger.max}, thirst ${d.needs.thirst.avg}/${d.needs.thirst.max}, ` +
+        `fatigue ${d.needs.fatigue.avg}/${d.needs.fatigue.max}, boredom ${d.needs.boredom.avg}/${d.needs.boredom.max}.`,
+    );
+    const stocks = Object.entries(d.stocks).map(([r, n]) => `${r} ${n}`);
+    lines.push(`Stores: ${stocks.length > 0 ? stocks.join(', ') : 'empty'}.`);
+  }
+  lines.push(`${s.idleVillagers} idle of ${s.population}.`);
+  const w = policy?.weights ?? {};
+  const set = PRIORITIES.filter((p) => w[p] !== undefined);
+  if (set.length > 0) {
+    lines.push('Priorities now: ' + set.map((p) => `${p} ${w[p]!.toFixed(2)}`).join(', ') + '.');
+  }
+  if (acts.length > 0) {
+    lines.push('I ' + acts.map((a) => a.summary).join('; ') + '.');
+  } else {
+    lines.push('I left the village to its own devices.');
+  }
+  return lines.join(' ');
+}
+
+/**
+ * The strategy-reflection system prompt: the god looking back over a stretch of days
+ * to distil what tends to WORK for this particular village. Asks for one short lesson,
+ * not prose — a usable heuristic it can carry into tomorrow's deliberation.
+ */
+export function buildStrategyReflectionSystem(charter: string = DEFAULT_CHARTER): string {
+  return [
+    'You are the unseen god of an autonomous simulated village, thinking back over the',
+    'recent days to learn how best to steer this particular people.',
+    '',
+    `Your charter (the spirit you watch over them with): ${charter}`,
+    '',
+    'You are given a log of recent days — what the village needed and how you answered',
+    'with priorities and the odd act. Distil from it a SINGLE standing lesson: a concrete,',
+    'reusable heuristic for steering THIS village (e.g. "this village drifts into hunger;',
+    'keep food weighted high" or "raising recreation calms the restless faster than drama").',
+    'Write one or two sentences, plain and practical, in your own voice. Output ONLY the',
+    'lesson — no preamble, no lists, no tool calls.',
+  ].join('\n');
+}
+
+/** Render the recent deliberation records as the material for a strategy reflection. */
+export function buildStrategyReflectionUser(records: string[]): string {
+  return [
+    'Your recent days, oldest first:',
+    ...records,
+    '',
+    'Now write the single standing lesson you draw from them.',
+  ].join('\n');
 }
 
 /** One prayer awaiting the god's judgement, offered at the temple. */

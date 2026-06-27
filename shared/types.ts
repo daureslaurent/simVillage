@@ -186,6 +186,23 @@ export function isResourceKind(value: unknown): value is ResourceKind {
 /** The kinds of things that can exist in the world. Extend as phases grow. */
 export type EntityType = 'villager' | 'tree' | 'building' | 'cart';
 
+/**
+ * The id of the sole village in a single-village world — the default owner stamped
+ * on every owned entity (villager / building / cart) until a rival exists. The v3
+ * rival-village seam (design §10) keys ownership off `BaseEntity.villageId`; with one
+ * village every owned entity carries this, so nothing reads as contested and behaviour
+ * is exactly as before. A second village simply means a second id alongside it.
+ */
+export const DEFAULT_VILLAGE_ID = 'village_0';
+
+/**
+ * The id of the SECOND (rival) village in a two-village world (v3 P5 soft competition,
+ * design §10). The home village is {@link DEFAULT_VILLAGE_ID}; a rival cluster seeded
+ * opposite it carries this. Only the rival starter uses it — a world may grow more
+ * villages with further ids.
+ */
+export const RIVAL_VILLAGE_ID = 'village_1';
+
 /** Fields common to every entity. */
 export interface BaseEntity {
   /** Stable unique id, e.g. "villager_1" or "tree_42". */
@@ -193,6 +210,15 @@ export interface BaseEntity {
   type: EntityType;
   /** Current position in grid coordinates. May be fractional for smooth motion. */
   position: Vec2;
+  /**
+   * Which village OWNS this entity (v3 rival-village seam, design §10). A villager,
+   * building or cart belongs to exactly one village; neutral terrain (trees) leaves
+   * it unset. Optional and defaulting to {@link DEFAULT_VILLAGE_ID}, so a single-village
+   * world — and every old save that predates the field — behaves exactly as before.
+   * It only starts to matter once a second village exists and effects begin to enforce
+   * ownership (raids, territory claims, fog-of-war digests).
+   */
+  villageId?: string;
 }
 
 /** A static, immovable object. Sent once at connect time, never per-tick. */
@@ -240,7 +266,42 @@ export type BuildingKind =
   // It has no resource economy, but a villager standing at it can set the standing order
   // of ANY cart in the village (no need to walk out to each one), so the whole haulage
   // fleet is driven from one place. See `command_cart` and {@link BUILDABLES.depot}.
-  | 'depot';
+  | 'depot'
+  // ---- FORTIFICATIONS (v3 rival war) — placed by a village's god, never by the world
+  // generator. They carry `life` and turn raids into a real contest. See
+  // `shared/fortifications.ts` for their mechanics, life pools and combat constants.
+  //  - `wall`       — a 1×1 IMPASSABLE segment; a line of them rings the settlement so
+  //                   raiders must route the long way to a `gate`. Destructible (siege).
+  //  - `gate`       — a passable opening in a wall; own folk pass freely, a rival only
+  //                   if no defender is holding it. The one weak point in the ring.
+  //  - `watchtower` — extends the village's raid-detection reach: raids are spotted early.
+  //  - `barracks`   — musters defenders; a villager on a `guard` order posted near one
+  //                   (or at a gate) repels raiders rather than merely standing about.
+  //  - `war_camp`   — offensive muster: raiders staged near it strike harder and faster.
+  //  - `siege_ram`  — escorted against a rival `wall`, it batters the wall's life down
+  //                   fast, opening a breach where there was no gate.
+  | 'wall'
+  | 'gate'
+  | 'watchtower'
+  | 'barracks'
+  | 'war_camp'
+  | 'siege_ram';
+
+/**
+ * What a god may conjure into the world with `spawn_entity` — a lone `villager`
+ * newcomer, a `tree` to reshape terrain, or any FORTIFICATION building kind (a
+ * `wall` line, a `gate`, a `watchtower`, …). Kept as its own union so the spawn
+ * plumbing (god tool → event → engine) widens in exactly one place.
+ */
+export type SpawnableType =
+  | 'villager'
+  | 'tree'
+  | 'wall'
+  | 'gate'
+  | 'watchtower'
+  | 'barracks'
+  | 'war_camp'
+  | 'siege_ram';
 
 /**
  * The structures villagers can choose to RAISE together, named by a friendly id
@@ -395,6 +456,31 @@ export interface Building extends BaseEntity {
    * re-announced when a site opens or completes); only `stock` streams per-tick.
    */
   construction?: ConstructionState;
+  /**
+   * STRUCTURAL HEALTH — how much battering the building can still take before it is
+   * razed (v3 rival war). Every building has a pool sized by its kind (walls are
+   * tough, a gate weaker; ordinary buildings sit at a high default and are rarely
+   * touched). Raiders and siege rams whittle it down; at 0 a wall/gate is BREACHED
+   * and removed, opening the ring. Streamed per-tick (with `stock`) so damage shows
+   * live. Optional for back-compat: old saves omit it and the engine backfills the
+   * kind's max. See `shared/fortifications.ts` `BUILDING_MAX_LIFE`.
+   */
+  life?: number;
+  /** The building's full health pool — the cap `life` is restored toward / clamped to. */
+  maxLife?: number;
+  /**
+   * GATE state: whether the opening stands open (passable to rivals) or is being
+   * actively HELD by a defender (rivals blocked). Engine-derived each tick from
+   * whether a friendly guard is posted within reach; streamed so the client can draw
+   * the gate open vs barred. Meaningful only on `kind === 'gate'`.
+   */
+  open?: boolean;
+  /**
+   * SIEGE progress against this building, 0..1 — how close a besieging ram/raiders
+   * are to breaching it. Drives the client's breach-progress bar. Meaningful only on
+   * a wall/gate currently under siege; absent otherwise.
+   */
+  siegeProgress?: number;
 }
 
 /**
@@ -406,6 +492,12 @@ export interface Building extends BaseEntity {
 export interface BuildingStock {
   id: string;
   stock: Partial<Record<ResourceKind, number>>;
+  /** Current structural health, when it differs from full — drives the damage bar (v3 war). */
+  life?: number;
+  /** Gate hold state: true when standing open to rivals, false when a defender bars it. */
+  open?: boolean;
+  /** Siege progress 0..1 against this building, when under siege — drives the breach bar. */
+  siegeProgress?: number;
 }
 
 /** The kinds of thing that can happen to a building, recorded in its activity log. */
@@ -467,6 +559,230 @@ export interface VillagerNeeds {
 
 /** How many items a villager may carry at once. */
 export const BACKPACK_CAPACITY = 5;
+
+// ---------------------------------------------------------------------------
+// v3 — supervisor POLICY + WORLD DIGEST (design §5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The standing strategic levers the v3 supervisor sets to steer the whole village
+ * (design §5.2). Each is a 0..1 weight folded into every villager's utility scores,
+ * biasing the discretionary work the village chooses (grow food, gather, build, …)
+ * without ever overriding self-preservation. The supervisor changes these slowly;
+ * villagers' own needs still drive the moment-to-moment loop.
+ */
+export type Priority =
+  | 'food'
+  | 'water'
+  | 'rest'
+  | 'recreation'
+  | 'build'
+  | 'gather'
+  | 'defense'
+  | 'expand';
+
+/** Every priority, as a runtime list — the closed vocabulary the supervisor sets weights over. */
+export const PRIORITIES: readonly Priority[] = [
+  'food',
+  'water',
+  'rest',
+  'recreation',
+  'build',
+  'gather',
+  'defense',
+  'expand',
+];
+
+/**
+ * The village's standing POLICY: the supervisor's priority weights plus the reasoning
+ * behind them. Broadcast to every villager (where the utility brain reads it), shown in
+ * the UI, and persisted so it survives a reboot. Empty weights ⇒ the village runs neutral.
+ */
+export interface VillagePolicy {
+  /** 0..1 per priority; absent priorities fall back to a neutral baseline in the brain. */
+  weights: Partial<Record<Priority, number>>;
+  /** Why the supervisor set this policy — surfaced in the UI / chronicle. */
+  rationale?: string;
+  /** The in-world day the policy was set (for telemetry + persistence). */
+  day?: number;
+  /**
+   * Which village this policy governs (v3 rival-village seam). Set when broadcast so a
+   * villager applies only its OWN supervisor's policy; absent ⇒ the single-village default
+   * ({@link DEFAULT_VILLAGE_ID}), which every villager accepts.
+   */
+  villageId?: string;
+}
+
+/** An aggregate of one need across the village: its average and its worst (max) value. */
+export interface NeedStat {
+  avg: number;
+  max: number;
+}
+
+/**
+ * What ONE supervisor can observe of a RIVAL village (v3 rival-village seam, design
+ * §10) — deliberately PARTIAL: fog-of-war. A supervisor sees the rival's rough size
+ * and visible activity, never its exact stocks or per-villager needs. Folded into the
+ * world digest only once a second village exists; absent in a single-village world, so
+ * a lone village's prompt is unchanged.
+ */
+export interface RivalDigest {
+  /** The rival village's id. */
+  villageId: string;
+  /** Rough headcount of the rival — an estimate, not a census. */
+  population: number;
+  /** How many structures the rival is seen to hold. */
+  buildings: number;
+  /**
+   * Roughly WHERE the rival settlement lies (the centroid of its visible folk). Fog-of-war
+   * still — you can see the smoke of their square, not their books — but enough for a god to
+   * point a raiding party at it via an `issue_order` raid. Absent if none are in view.
+   */
+  center?: Vec2;
+  /** A one-line read on what the rival seems to be up to, for the prompt + chronicle. */
+  activity: string;
+}
+
+/**
+ * The compact, AGGREGATED snapshot the supervisor reasons over to set policy (design
+ * §5.1) — never raw per-villager state. Assembled by the engine's daily aggregator and
+ * carried on the daily summary. Grows with the rival digest + vision in later phases.
+ */
+export interface WorldDigestVitals {
+  /** Average + worst of each physical need across all villagers. */
+  needs: Record<keyof VillagerNeeds, NeedStat>;
+  /** Total units of each resource held across every building's stock. */
+  stocks: Partial<Record<ResourceKind, number>>;
+  /** Per building-kind: how many exist, and how many are running low on stock. */
+  buildings: { kind: string; count: number; lowStock: number }[];
+  /**
+   * What this village can observe of a RIVAL (fog-of-war, design §10). Present only
+   * once a second village exists; absent — and unread — in a single-village world.
+   */
+  rival?: RivalDigest;
+}
+
+// ---------------------------------------------------------------------------
+// v3 P4 — WORLD EVENTS (design §9.2). The engine, not just the LLM, can fire
+// salient happenings — a famine setting in, a store run dry, a newcomer, a
+// surplus — so the supervisor faces a CHANGING, contested world instead of a flat
+// daily readout. These are the anti-repetition "variety engine": legible signals
+// the god reacts to. They ride the daily digest as colour, and a high-salience one
+// INTERRUPTS the god's daily cadence (design §8) for an out-of-turn deliberation.
+// ---------------------------------------------------------------------------
+
+/** What kind of world happening a {@link DigestEvent} reports. */
+export type DigestEventKind =
+  // A need has turned dire across the village (famine = hunger, drought = thirst, …).
+  | 'famine'
+  // A whole resource store has run dry (food/water/wood/goods hit zero).
+  | 'shortage'
+  // A resource has piled up well past what the village needs — plenty to spend.
+  | 'surplus'
+  // A new villager has appeared (spawned or wandered in).
+  | 'newcomer'
+  // A structure was finished — a concrete step toward a city.
+  | 'build_complete'
+  // The village has gone listless — many villagers idle, little happening.
+  | 'stagnation'
+  // A rival villager took resources from one of this village's buildings (v3 P5 soft
+  // competition, design §10) — a raid the god should answer (raise defense, post guards).
+  | 'raid';
+
+/** How loudly an event should be heard. A `crisis` interrupts the god's daily cadence. */
+export type DigestEventSalience = 'info' | 'warning' | 'crisis';
+
+/** Every event kind, as a runtime list (for validation / iteration). */
+export const DIGEST_EVENT_KINDS: readonly DigestEventKind[] = [
+  'famine',
+  'shortage',
+  'surplus',
+  'newcomer',
+  'build_complete',
+  'stagnation',
+  'raid',
+];
+
+/** One salient world happening the engine detected, for the supervisor to weigh. */
+export interface DigestEvent {
+  kind: DigestEventKind;
+  salience: DigestEventSalience;
+  /** A short human line for the prompt + logs, e.g. "Hunger has turned dire (avg 78)." */
+  text: string;
+  /** The sim day the event fired on. */
+  day: number;
+  /** The sim tick the event fired on. */
+  tick: number;
+  /**
+   * Which village this happening is ABOUT (v3 rival-village seam). Lets an alert wake
+   * only that village's supervisor. Optional + defaulting to {@link DEFAULT_VILLAGE_ID}
+   * so a single-village world is unchanged.
+   */
+  villageId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// v3 — supervisor ORDERS (design §5.2). The targeted, expiring override lever:
+// the policy steers ~90% of behaviour; an order pushes specific villagers at a
+// specific task for a while. Orders are SOFT — a villager obeys via a large
+// utility bonus but still self-preserves (won't ignore starvation) — and EXPIRE
+// (`ttlTicks`), after which the village relaxes back to the standing policy.
+// ---------------------------------------------------------------------------
+
+/**
+ * The kind of task an order directs villagers to do (maps onto utility-brain behaviours).
+ * `raid` (v3 P5) sends villagers across to a rival's territory to seize its stores.
+ */
+export type OrderTask = 'build' | 'gather' | 'haul' | 'guard' | 'move' | 'work' | 'socialize' | 'raid';
+
+/** Every order task, as a runtime list — the closed vocabulary for `issue_order`. */
+export const ORDER_TASKS: readonly OrderTask[] = [
+  'build',
+  'gather',
+  'haul',
+  'guard',
+  'move',
+  'work',
+  'socialize',
+  'raid',
+];
+
+/** WHO an order is aimed at. Empty ⇒ the whole village. */
+export interface OrderTarget {
+  /** Specific villager ids. */
+  villagerIds?: string[];
+  /** A role/trait keyword (matched against a villager's traits), e.g. "builder". */
+  role?: string;
+  /** Advisory cap on how many should obey (not strictly enforced in P3). */
+  count?: number;
+}
+
+/** The specifics of an order — which place, which resource, where. */
+export interface OrderParams {
+  buildingId?: string;
+  resource?: ResourceKind;
+  x?: number;
+  y?: number;
+}
+
+/** A single standing order the supervisor (or a human) pushes at the village. */
+export interface VillageOrder {
+  /** Stable id (the issuing bus eventId), so a later order can replace it. */
+  id: string;
+  target: OrderTarget;
+  task: OrderTask;
+  params: OrderParams;
+  /** Expires this many in-world ticks after a villager receives it; absent ⇒ until replaced. */
+  ttlTicks?: number;
+  /** Why it was issued — surfaced in the UI / chronicle. */
+  rationale?: string;
+  /**
+   * Which village this order is for (v3 rival-village seam). Set when broadcast so only
+   * that village's villagers obey it; absent ⇒ the single-village default
+   * ({@link DEFAULT_VILLAGE_ID}).
+   */
+  villageId?: string;
+}
 
 /**
  * A job a villager has taken on that spans several ticks. Today the only kind is
@@ -534,6 +850,35 @@ export interface Villager extends BaseEntity {
    * later) with its power restored. The engine owns this flag and the wake timer.
    */
   asleep: boolean;
+  /**
+   * LIFE — the villager's health, 0..{@link maxLife} (v3 rival war). Whole while at
+   * peace; combat at a contested gate or raid drains it. There is NO permanent death:
+   * a villager whose life hits 0 is DOWNED (see {@link downed}) — it breaks off, flees
+   * home, and its life regenerates until it can rejoin. Out of combat, life mends
+   * slowly on its own. Optional for back-compat; the engine backfills full health on
+   * a save that predates it. See `shared/fortifications.ts`. Optional so hand-written
+   * seeds and pre-war saves need not carry it — the engine backfills full health on load.
+   */
+  life?: number;
+  /** The villager's full health pool — the cap `life` mends toward and is clamped to. */
+  maxLife?: number;
+  /**
+   * DOWNED — true while a villager has been beaten to 0 life and is retreating home to
+   * recover. A downed villager drops its errand and its mind goes quiet (like
+   * {@link asleep}): the coordinator grants it no LLM turns, it cannot fight, raid or
+   * be hit again, and it heads for the nearest friendly house, rejoining once its life
+   * has mended past the recovery mark. The engine owns this flag.
+   */
+  downed?: boolean;
+  /**
+   * The id of the HOUSE this villager owns and sleeps in (v3 housing). Every villager
+   * is given its OWN home: it turns in there to shed fatigue, and downed it limps there
+   * to recover. The engine assigns it — matching free houses to villagers who lack one
+   * when a house is raised, when a newcomer arrives, and once on load — so the village
+   * builds a new house only while someone is still homeless. Optional for back-compat:
+   * old saves omit it and the engine backfills an assignment from the existing houses.
+   */
+  homeId?: string;
 }
 
 /**
@@ -793,6 +1138,48 @@ export const DEFAULT_TERRAIN_PALETTE: TerrainPalette = {
 export type VillageSize = 'small' | 'medium' | 'large';
 
 /**
+ * A village's RAID STANCE in a two-village (rival) world — a soft, prompt-level
+ * dial chosen at setup, fed into that side's god (supervisor) charter so it raids
+ * more or less readily. Purely a nudge to the LLM; no engine mechanic changes.
+ */
+export type CompetitionIntensity = 'peaceful' | 'balanced' | 'aggressive';
+
+/** The default raid stance when none is chosen — even-handed. */
+export const DEFAULT_COMPETITION_INTENSITY: CompetitionIntensity = 'balanced';
+
+/**
+ * The setup parameters for ONE side of a two-village (rival) world, chosen
+ * independently on the rival setup screen: its own style (which fully themes its
+ * roster, building names and ground palette), villager count, size and raid stance.
+ * All optional so a partial choice falls back to the backend's defaults.
+ */
+export interface VillageSetupParams {
+  /** Free-text style that fully themes this side (names, roster, ground palette). */
+  style?: string;
+  /** Villager count for this side (slider); clamped to the backend ceiling. */
+  villagers?: number;
+  /** Village size/density for this side. */
+  size?: VillageSize;
+  /** This side's raid stance, fed to its god's charter (soft). */
+  intensity?: CompetitionIntensity;
+}
+
+/**
+ * The rival-mode setup block: a shared map/valley BACKDROP plus the two sides'
+ * independent {@link VillageSetupParams}. `mapTheme` is a loose mood hint passed to
+ * BOTH sides' generation (and drives the setup screen's live colour preview); each
+ * side still themes itself fully, so the two grounds read apart on one map.
+ */
+export interface RivalSetupParams {
+  /** Shared valley backdrop/mood hint; also what the live colour preview reflects. */
+  mapTheme?: string;
+  /** The home (west) settlement's parameters. */
+  home: VillageSetupParams;
+  /** The rival (east) settlement's parameters. */
+  rival: VillageSetupParams;
+}
+
+/**
  * The complete, persistable description of a world. This is what the engine is
  * constructed from, what gets written to / read from MongoDB, and what a
  * snapshot looks like. Keeping it a plain data shape (no methods) makes it
@@ -845,6 +1232,19 @@ export interface WorldSeed {
    * saves, where the client falls back to the default.
    */
   palette?: TerrainPalette;
+  /**
+   * In a TWO-village (rival) world, the SECOND ground palette: `palette` paints the
+   * map WEST of {@link paletteSplitX} (the home side) and this paints the EAST (the
+   * rival side), so each settlement reads in its own terrain on one shared map.
+   * Absent in single-village worlds, where `palette` covers the whole ground.
+   */
+  rivalPalette?: TerrainPalette;
+  /**
+   * The x tile-coordinate where the ground switches from {@link palette} (west) to
+   * {@link rivalPalette} (east) — the territory midline of a two-village world.
+   * Only meaningful alongside `rivalPalette`; absent in single-village worlds.
+   */
+  paletteSplitX?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +1282,12 @@ export interface WorldNeedsSetupMessage {
   defaultVillagers: number;
   /** Initial size selection. */
   defaultSize: VillageSize;
+  /**
+   * Whether this is a TWO-village (rival) world (RIVAL_VILLAGE=on). When set, the
+   * setup screen shows the rival layout: a shared map theme plus independent per-side
+   * style / villager-count / size / raid-stance controls. Absent/false = single village.
+   */
+  rival?: boolean;
 }
 
 /**
@@ -917,6 +1323,10 @@ export interface WorldInitMessage {
   setting?: string;
   /** Themed ground colours (see {@link TerrainPalette}); absent in old saves. */
   palette?: TerrainPalette;
+  /** Second ground palette for the rival (east) side of a two-village world; see {@link WorldSeed.rivalPalette}. */
+  rivalPalette?: TerrainPalette;
+  /** Tile x where the ground switches from {@link palette} to {@link rivalPalette}; see {@link WorldSeed.paletteSplitX}. */
+  paletteSplitX?: number;
 }
 
 /**
@@ -965,7 +1375,7 @@ export interface VillagerThoughtMessage {
   rawOutput: string;
   decision: AgentDecision | null;
   /** `'fallback'` when the decision was a scripted substitute, not LLM-authored. */
-  decisionSource?: 'llm' | 'fallback';
+  decisionSource?: 'llm' | 'utility' | 'fallback';
   /**
    * The full agentic TRACE for this turn — every lookup, action, and the final
    * yield, in order. Present for minds that run the multi-step loop; absent for a
@@ -1012,7 +1422,7 @@ export interface VillagerActionRecord {
    * usable — its `rawOutput` is then empty/partial). Absent on records written
    * before this field existed; treat absence as `'llm'`.
    */
-  decisionSource?: 'llm' | 'fallback';
+  decisionSource?: 'llm' | 'utility' | 'fallback';
   /** The full agentic trace for the turn this action came from, when the mind ran the loop. */
   steps?: AgentTraceStep[];
   /** Server wall-clock time the action was recorded, ISO-8601 on the wire. */
@@ -1352,6 +1762,12 @@ export interface SupervisorPrayerMessage {
   villagerName: string;
   message: string;
   tick: number;
+  /**
+   * Which village the praying villager belongs to (v3 rival-village seam). The gateway
+   * stamps it from the villager's `villageId`, defaulting to {@link DEFAULT_VILLAGE_ID},
+   * so the N-village god console can file each petition under its own village.
+   */
+  villageId: string;
 }
 
 /**
@@ -1363,6 +1779,12 @@ export interface SupervisorActionMessage {
   kind: 'supervisor.action';
   action: string;
   summary: string;
+  /**
+   * Which village's god took the act (v3 rival-village seam). Stamped by the gateway from
+   * the command's `villageId` (or the target villager's), defaulting to
+   * {@link DEFAULT_VILLAGE_ID}, so the console can attribute each divine act to a side.
+   */
+  villageId: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,6 +1824,76 @@ export interface VillageVision {
   milestones: VillageMilestone[];
   /** The in-world day this vision was last reassessed (0 before the first night). */
   updatedDay: number;
+  /**
+   * Which village this vision belongs to (v3 rival-village seam). Set when broadcast so
+   * a villager carries only its own village's stage/milestones; absent ⇒ the
+   * single-village default ({@link DEFAULT_VILLAGE_ID}).
+   */
+  villageId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// v3 — VILLAGE SCORE (a head-to-head competition metric, design §10)
+// ---------------------------------------------------------------------------
+
+/**
+ * The PILLARS a {@link VillageScore} breaks down into. Each is its own 0..100
+ * sub-score so the HUD and supervisor can see WHY a village leads or trails, not
+ * just the bottom line. Deliberately NOT survival/needs — a village that merely
+ * keeps its people fed is treading water; the score measures the things two
+ * villages actually compete over.
+ */
+export interface VillageScorePillars {
+  /**
+   * GROWTH — how built-up the settlement is: its structures and its population.
+   * The visible footprint a rival sees across the valley.
+   */
+  growth: number;
+  /**
+   * SOCIAL — how alive and cohesive the village is, read from how much its people
+   * talk and act together rather than idling apart.
+   */
+  social: number;
+  /**
+   * DEFENSE — the village's standing in the raiding game: how its raids inflicted
+   * on rivals balance against the raids it has suffered. 50 is untested neutrality.
+   */
+  defense: number;
+}
+
+/** Every pillar key, as a runtime list — for iterating the breakdown in the UI. */
+export const VILLAGE_SCORE_PILLARS: readonly (keyof VillageScorePillars)[] = [
+  'growth',
+  'social',
+  'defense',
+];
+
+/**
+ * One village's COMPETITION SCORE: a single 0..100 number plus the per-pillar
+ * breakdown it is blended from. Computed by the daily aggregator off the same
+ * per-village snapshot the digest is built from, so it never needs the engine's
+ * internals. Emitted for every village at once as a {@link VillageScoreboard} so
+ * the head-to-head is always apples-to-apples.
+ */
+export interface VillageScore {
+  villageId: string;
+  /** A human label for the village, if known (e.g. its name), else the id. */
+  villageName?: string;
+  /** The blended 0..100 overall standing. */
+  overall: number;
+  /** The 0..100 sub-scores `overall` is weighted from. */
+  pillars: VillageScorePillars;
+}
+
+/**
+ * The leaderboard across every village, recomputed each aggregator pulse + day
+ * boundary. `scores` is sorted by `overall` descending, so `scores[0]` leads.
+ * With a single village it carries exactly one entry — a score against no rival.
+ */
+export interface VillageScoreboard {
+  day: number;
+  tick: number;
+  scores: VillageScore[];
 }
 
 /** A single divine act the god took during a day, for the chronicle's ledger. */
@@ -1459,6 +1951,60 @@ export interface SupervisorDailyReportMessage {
 }
 
 /**
+ * The village COMPETITION SCOREBOARD pushed to the browser: the live head-to-head
+ * standing for the HUD chip and the supervisor panel breakdown. Pushed on connect
+ * (replayed from the gateway's cache) and on every aggregator pulse / day boundary.
+ */
+export interface VillageScoreMessage {
+  kind: 'village.score';
+  scoreboard: VillageScoreboard;
+}
+
+/**
+ * A per-village CENSUS — the concrete vitals a multi-village UI shows beside the
+ * abstract 0..100 score: how many people, how much of each resource is stored, and
+ * what structures stand. Derived by the gateway from the per-village digest the
+ * aggregator already emits (`village.pulse` / `village.daily_summary`), so no new
+ * server emitter is needed. Emitted for EVERY known village together so the head-to-
+ * head reads apples-to-apples, mirroring {@link VillageScoreboard}.
+ */
+export interface VillageCensus {
+  villageId: string;
+  /** Headcount of living villagers in the village. */
+  population: number;
+  /** Total units of each resource held across the village's building stocks. */
+  resources: Partial<Record<ResourceKind, number>>;
+  /** Per building-kind: how many stand. Drawn from the digest's building tallies. */
+  structures: { kind: string; count: number }[];
+  /** How many of the village's structures are fortifications (walls/gates/towers/etc). */
+  fortCount: number;
+}
+
+/**
+ * The census across every village, pushed to the browser on each aggregator pulse and
+ * cached for replay on connect (like {@link VillageScoreMessage}). The client groups its
+ * entities by `villageId` as a live fallback, but this is the authoritative tally.
+ */
+export interface VillageCensusMessage {
+  kind: 'village.census';
+  day: number;
+  tick: number;
+  villages: VillageCensus[];
+}
+
+/**
+ * A salient WORLD EVENT surfaced to the browser — a raid, famine, shortage, surplus,
+ * newcomer, completed build or stagnation — tagged with the village it is ABOUT so the
+ * UI can raise a per-village alert/ticker. Mirrors the bus `village.alert`
+ * ({@link DigestEvent}); the gateway forwards it and keeps a short replay buffer.
+ */
+export interface VillageAlertMessage {
+  kind: 'village.alert';
+  villageId: string;
+  event: DigestEvent;
+}
+
+/**
  * The current per-purpose REASONING-EFFORT configuration, pushed to the browser
  * on connect and on every change so the settings window mirrors the live state
  * (and stays in sync across multiple open tabs). The single source of truth lives
@@ -1497,6 +2043,9 @@ export type ServerMessage =
   | SupervisorPrayerMessage
   | SupervisorActionMessage
   | SupervisorDailyReportMessage
+  | VillageScoreMessage
+  | VillageCensusMessage
+  | VillageAlertMessage
   | RelationshipUpdateMessage
   | GroupPlanMessage
   | AgendaUpdateMessage
@@ -1542,9 +2091,18 @@ export interface VillagerMoveCommand {
  */
 export interface SpawnEntityCommand {
   command: 'spawn_entity';
-  entityType: 'villager' | 'tree';
+  entityType: SpawnableType;
   x: number;
   y: number;
+  /**
+   * For a `wall` (or `gate`): how many segments to lay in a LINE from (x, y). One
+   * tile per segment, marching along {@link orientation}. Ignored by point spawns
+   * (villager / tree / single fort buildings). A wall line of length>2 auto-leaves
+   * one `gate` near its middle so the ring it forms is actually enterable.
+   */
+  length?: number;
+  /** Direction a wall line marches: 'h' = east along +x, 'v' = south along +y. */
+  orientation?: 'h' | 'v';
 }
 
 /** The God Agent's request to set the village-wide weather. */
@@ -1696,11 +2254,27 @@ export interface SupervisorVerdictCommand {
   villagerName: string;
   message: string;
   verdict: 'choose' | 'reject';
+  /**
+   * Which village's god should hear this verdict (v3 rival-village seam). With one
+   * supervisor per village the gateway routes by it; absent ⇒ {@link DEFAULT_VILLAGE_ID}.
+   * The console fills it from the prayer's `villageId`.
+   */
+  villageId?: string;
 }
 
 /** Force the Supervisor (god) to weigh the pending prayers NOW (answers at most one), off-cadence. */
 export interface SupervisorForceRunCommand {
   command: 'supervisor_force_run';
+  /** Which village's god to force-run (v3 rival seam); absent ⇒ {@link DEFAULT_VILLAGE_ID}. */
+  villageId?: string;
+}
+
+/** Pause (seize the wheel) or resume the autonomous LLM Supervisor — the v3 §8 human override. */
+export interface SupervisorPauseCommand {
+  command: 'supervisor_pause';
+  paused: boolean;
+  /** Which village's god to pause/resume (v3 rival seam); absent ⇒ {@link DEFAULT_VILLAGE_ID}. */
+  villageId?: string;
 }
 
 /**
@@ -1781,6 +2355,13 @@ export interface GenerateWorldCommand {
   villagers?: number;
   /** Village size/density for auto mode. */
   size?: VillageSize;
+  /**
+   * The TWO-village (rival) selections — a shared map theme plus independent per-side
+   * params. Present only when the backend is in rival mode (RIVAL_VILLAGE=on); the
+   * single-village `style`/`villagers`/`size` fields above are ignored when it is set.
+   * `mode` still selects auto (LLM) vs static (fixed-blueprint) generation.
+   */
+  rival?: RivalSetupParams;
 }
 
 /**
@@ -1812,6 +2393,7 @@ export type BrowserCommand =
   | PlantIdeaCommand
   | SupervisorVerdictCommand
   | SupervisorForceRunCommand
+  | SupervisorPauseCommand
   | GodSetWeatherCommand
   | GodBlessCommand
   | GodSmiteCommand
