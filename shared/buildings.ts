@@ -29,6 +29,7 @@
  */
 
 import type { BuildableId, BuildingKind, CartTier, ResourceKind, VillagerNeeds } from './types';
+import { FORT_COLORS, FORT_FUNCTIONS, fortificationGuideLines, isFortification } from './fortifications';
 
 /**
  * Which resource a need draws down when it is relieved. Drinking consumes
@@ -261,6 +262,13 @@ export const BUILDING_COLORS: Record<BuildingKind, string> = {
   lamp: '#e8c95a',
   landmark: '#a98fd0',
   depot: '#4a6b8c',
+  // Fortifications — sourced from the war module so the look lives in one place.
+  wall: FORT_COLORS.wall!,
+  gate: FORT_COLORS.gate!,
+  watchtower: FORT_COLORS.watchtower!,
+  barracks: FORT_COLORS.barracks!,
+  war_camp: FORT_COLORS.war_camp!,
+  siege_ram: FORT_COLORS.siege_ram!,
 };
 
 /**
@@ -287,6 +295,13 @@ export const BUILDING_FUNCTIONS: Record<BuildingKind, string> = {
   // this line shows only when none was given.
   landmark: 'a landmark the villagers raised together',
   depot: 'the technical station from which any robot-cart can be dispatched to haul for the village',
+  // Fortifications — sourced from the war module (see shared/fortifications.ts).
+  wall: FORT_FUNCTIONS.wall!,
+  gate: FORT_FUNCTIONS.gate!,
+  watchtower: FORT_FUNCTIONS.watchtower!,
+  barracks: FORT_FUNCTIONS.barracks!,
+  war_camp: FORT_FUNCTIONS.war_camp!,
+  siege_ram: FORT_FUNCTIONS.siege_ram!,
 };
 
 // ---------------------------------------------------------------------------
@@ -538,6 +553,11 @@ export function buildingAmbience(kind: BuildingKind): number {
  * callers that want a single string.
  */
 export function buildingGuideLines(kind: BuildingKind): string[] {
+  // Fortifications speak in their own (war) voice — defer to the war module's prose
+  // rather than describing them as economy buildings.
+  if (isFortification(kind)) {
+    return [...fortificationGuideLines(kind), 'Stand within a few tiles of it before you act there.'];
+  }
   const fn = BUILDING_FUNCTIONS[kind];
   const lines: string[] = [`The ${kind.replace(/_/g, ' ')} — ${fn}.`];
 

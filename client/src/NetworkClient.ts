@@ -28,8 +28,12 @@ import type {
   WorldNeedsSetupMessage,
   WorldStylePreviewMessage,
   VillageSize,
+  RivalSetupParams,
   SupervisorActionMessage,
   SupervisorDailyReportMessage,
+  VillageScoreboard,
+  VillageCensus,
+  DigestEvent,
   SupervisorPrayerMessage,
   RelationshipUpdateMessage,
   GroupPlanMessage,
@@ -42,6 +46,7 @@ import type {
   ReasoningEffort,
   LlmModelConfig,
   LlmPoolConfig,
+  BuildingStock,
 } from '../../shared/types';
 
 /** A flattened, latest-known snapshot the renderer can draw directly. */
@@ -61,6 +66,10 @@ export interface WorldView {
   gatherings: Gathering[];
   /** Themed ground colours from world.init (null until the first init; default if the world has none). */
   palette: TerrainPalette | null;
+  /** Second ground palette for the rival (east) side of a two-village world; null otherwise. */
+  rivalPalette: TerrainPalette | null;
+  /** Tile x where the ground switches from `palette` (west) to `rivalPalette` (east); null in single-village worlds. */
+  paletteSplitX: number | null;
 }
 
 export class NetworkClient {
@@ -80,6 +89,8 @@ export class NetworkClient {
     weather: 'clear',
     gatherings: [],
     palette: null,
+    rivalPalette: null,
+    paletteSplitX: null,
   };
 
   /** Optional hook so the UI can react to connection state changes. */
@@ -108,6 +119,12 @@ export class NetworkClient {
   onSupervisorAction: ((action: SupervisorActionMessage) => void) | null = null;
   /** Optional hook fed the god's nightly chronicle, for the summary window. */
   onDailyReport: ((message: SupervisorDailyReportMessage) => void) | null = null;
+  /** Optional hook fed the village competition scoreboard, for the HUD chip + supervisor panel. */
+  onScoreboard: ((scoreboard: VillageScoreboard) => void) | null = null;
+  /** Optional hook fed the per-village census (population/resources/structures/forts). */
+  onVillageCensus: ((villages: VillageCensus[], day: number, tick: number) => void) | null = null;
+  /** Optional hook fed each tagged world alert (raid/famine/surplus/…), for the per-village ticker. */
+  onVillageAlert: ((villageId: string, event: DigestEvent) => void) | null = null;
   /** Optional hook fed each villager's revised social book, for the relationships view. */
   onRelationship: ((message: RelationshipUpdateMessage) => void) | null = null;
   /** Optional hook fed each opened/joined group plan, for the shared-plans view. */
@@ -182,7 +199,8 @@ export class NetworkClient {
     this.sendCommand({ command: 'plant_idea', targetId, memory });
   }
 
-  /** The temple console: grant or deny one villager prayer. */
+  /** The temple console: grant or deny one villager prayer. Routes to the prayer's
+   *  own village's god (v3 rival seam). */
   sendVerdict(prayer: SupervisorPrayerMessage, verdict: 'choose' | 'reject'): void {
     this.sendCommand({
       command: 'supervisor_verdict',
@@ -191,12 +209,18 @@ export class NetworkClient {
       villagerName: prayer.villagerName,
       message: prayer.message,
       verdict,
+      villageId: prayer.villageId,
     });
   }
 
-  /** The temple console: force the god to weigh the pending prayers now (answers at most one). */
-  forceRun(): void {
-    this.sendCommand({ command: 'supervisor_force_run' });
+  /** The temple console: force a village's god to weigh its pending prayers now (answers at most one). */
+  forceRun(villageId?: string): void {
+    this.sendCommand({ command: 'supervisor_force_run', ...(villageId ? { villageId } : {}) });
+  }
+
+  /** The temple console: pause (seize the wheel) or resume a village's autonomous LLM supervisor. */
+  pauseSupervisor(paused: boolean, villageId?: string): void {
+    this.sendCommand({ command: 'supervisor_pause', paused, ...(villageId ? { villageId } : {}) });
   }
 
   /** Divine power: set the village-wide weather directly. */
@@ -240,7 +264,13 @@ export class NetworkClient {
   }
 
   /** Setup screen: create the village (auto-generate with a style, or the static village). */
-  generateWorld(opts: { mode: 'auto' | 'static'; style?: string; villagers?: number; size?: VillageSize }): void {
+  generateWorld(opts: {
+    mode: 'auto' | 'static';
+    style?: string;
+    villagers?: number;
+    size?: VillageSize;
+    rival?: RivalSetupParams;
+  }): void {
     this.sendCommand({ command: 'generate_world', ...opts });
   }
 
@@ -275,6 +305,8 @@ export class NetworkClient {
         this.view.buildings = message.buildings;
         this.view.weather = message.weather;
         this.view.palette = message.palette ?? null;
+        this.view.rivalPalette = message.rivalPalette ?? null;
+        this.view.paletteSplitX = message.paletteSplitX ?? null;
         this.onWeather?.(message.weather);
         this.onTheme?.(message.theme ?? '', message.setting ?? '');
         // The world exists now: dismiss any generation overlay.
@@ -335,6 +367,15 @@ export class NetworkClient {
       case 'supervisor.daily_report':
         this.onDailyReport?.(message);
         break;
+      case 'village.score':
+        this.onScoreboard?.(message.scoreboard);
+        break;
+      case 'village.census':
+        this.onVillageCensus?.(message.villages, message.day, message.tick);
+        break;
+      case 'village.alert':
+        this.onVillageAlert?.(message.villageId, message.event);
+        break;
       case 'relationship.updated':
         this.onRelationship?.(message);
         break;
@@ -360,13 +401,23 @@ export class NetworkClient {
     }
   }
 
-  /** Overlay the per-tick building-stock stream onto the cached static buildings. */
-  private applyBuildingStocks(stocks: { id: string; stock: Building['stock'] }[]): void {
+  /**
+   * Overlay the per-tick building stream onto the cached static buildings: the live
+   * resource stock, plus the war-layer state (structural `life`, gate `open`/held, and
+   * `siegeProgress`) so damage bars, breaches and barred gates show live.
+   */
+  private applyBuildingStocks(stocks: BuildingStock[]): void {
     if (stocks.length === 0) return;
-    const byId = new Map(stocks.map((s) => [s.id, s.stock]));
+    const byId = new Map(stocks.map((s) => [s.id, s]));
     for (const b of this.view.buildings) {
-      const stock = byId.get(b.id);
-      if (stock) b.stock = stock;
+      const upd = byId.get(b.id);
+      if (!upd) continue;
+      b.stock = upd.stock;
+      if (upd.life !== undefined) b.life = upd.life;
+      // `open` / `siegeProgress` are only sent while relevant; mirror absence as cleared
+      // so a gate that is re-held, or a wall no longer besieged, drops its overlay.
+      b.open = upd.open;
+      b.siegeProgress = upd.siegeProgress;
     }
   }
 

@@ -209,8 +209,8 @@ export class RabbitMqTransport implements Transport {
   private handleSupervisorCommand(event: SupervisorCommandEvent): void {
     switch (event.type) {
       case 'supervisor.spawn_entity': {
-        const { entityType, x, y } = event.payload;
-        this.engine.dispatchCommand({ command: 'spawn_entity', entityType, x, y });
+        const { entityType, x, y, length, orientation } = event.payload;
+        this.engine.dispatchCommand({ command: 'spawn_entity', entityType, x, y, length, orientation });
         return;
       }
       case 'supervisor.change_weather': {

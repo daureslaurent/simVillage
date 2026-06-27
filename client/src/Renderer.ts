@@ -26,6 +26,14 @@ import { BACKPACK_CAPACITY, DEFAULT_TERRAIN_PALETTE } from '../../shared/types';
 import { deriveAppearance } from '../../shared/appearance';
 import { drawVillagerSprite } from './villagerSprite';
 import { buildingStockKinds, isDepleted, SERVICE_REACH } from '../../shared/buildings';
+import {
+  isFortification,
+  isGate,
+  buildingMaxLife,
+  VILLAGER_MAX_LIFE,
+  BASE_DETECTION_RADIUS,
+  WATCHTOWER_DETECTION_BONUS,
+} from '../../shared/fortifications';
 import { daylightFromTick } from '../../shared/simClock';
 import { sightRadius, hearingRadius } from '../../shared/perception';
 import type { NetworkClient, WorldView } from './NetworkClient';
@@ -268,10 +276,17 @@ export class Renderer {
     // Buildings: filled rectangular footprints with a label when zoomed in enough.
     this.drawBuildings(view.buildings, scale);
 
-    // Trees: static squares in the village's vegetation colour.
-    ctx.fillStyle = (view.palette ?? DEFAULT_TERRAIN_PALETTE).vegetation;
+    // Trees: static squares in the village's vegetation colour. In a two-village world
+    // each tree takes the vegetation of the side it stands on (split at the midline).
+    const treePalette = view.palette ?? DEFAULT_TERRAIN_PALETTE;
+    const treeRival = view.rivalPalette ?? null;
+    const treeSplit = treeRival && view.paletteSplitX !== null ? view.paletteSplitX : null;
     const treeSize = Math.max(2, scale);
+    if (treeSplit === null) ctx.fillStyle = treePalette.vegetation;
     for (const tree of view.trees) {
+      if (treeSplit !== null && treeRival) {
+        ctx.fillStyle = tree.position.x >= treeSplit ? treeRival.vegetation : treePalette.vegetation;
+      }
       ctx.fillRect(
         tree.position.x * scale + this.panX,
         tree.position.y * scale + this.panY,
@@ -335,8 +350,32 @@ export class Renderer {
         ay,
         villagerRadius,
         villager.appearance ?? deriveAppearance(villager.id, villager.color),
-        { dim: villager.asleep },
+        { dim: villager.asleep || villager.downed === true },
       );
+
+      // The war layer (v3): a thin red HEALTH bar over a wounded villager, and a
+      // floating crossed-swords mark over the downed as they limp home to recover.
+      const maxLife = villager.maxLife ?? VILLAGER_MAX_LIFE;
+      const lifeFrac = Math.max(0, Math.min(1, (villager.life ?? maxLife) / maxLife));
+      if (lifeFrac < 1 || villager.downed) {
+        const barW = villagerRadius * 2;
+        const barH = Math.max(2, villagerRadius * 0.28);
+        const bx = ax - barW / 2;
+        const by = ay - villagerRadius * 1.7;
+        ctx.fillStyle = 'rgba(13, 17, 23, 0.75)';
+        ctx.fillRect(bx, by, barW, barH);
+        ctx.fillStyle = lifeFrac > 0.5 ? '#3fb950' : lifeFrac > 0.25 ? '#d29922' : '#f85149';
+        ctx.fillRect(bx, by, barW * lifeFrac, barH);
+      }
+      if (villager.downed) {
+        ctx.save();
+        const bob = Math.sin(Date.now() / 400 + ax) * 2;
+        ctx.font = `${Math.max(12, villagerRadius * 1.2)}px system-ui, -apple-system, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText('💢', ax + villagerRadius * 1.2, ay - villagerRadius * 1.8 + bob);
+        ctx.restore();
+      }
 
       // Asleep: a little floating "💤" that gently bobs above the body, so a
       // sleeping villager (whose mind is dark) reads at a glance on the map.
@@ -684,6 +723,14 @@ export class Renderer {
       const w = b.width * scale;
       const h = b.height * scale;
 
+      // Fortifications read in their own visual language (no economy band) — walls as a
+      // solid rampart, gates open/barred, the muster buildings glyphed — plus their
+      // structural-health and siege bars. Drawn here and then skipped from the rest.
+      if (isFortification(b.kind)) {
+        this.drawFortification(b, x, y, w, h, scale);
+        continue;
+      }
+
       // The INTERACTION ZONE: the footprint grown by SERVICE_REACH tiles on every
       // side — the area a villager can stand in to use this place. Drawn as a faint
       // tinted band with a dashed border so it reads as "near enough to act here",
@@ -757,6 +804,123 @@ export class Renderer {
   }
 
   /**
+   * Draw one fortification (v3 war): a solid wall segment, an open or barred gate, or
+   * a glyphed muster building — each with a structural-health bar when damaged and a
+   * red siege bar while under the ram. A selected watchtower also shows its detection
+   * ring so the player can see how far it watches.
+   */
+  private drawFortification(b: Building, x: number, y: number, w: number, h: number, scale: number): void {
+    const { ctx } = this;
+    const selected = b.id === this.selectedBuildingId;
+    const max = b.maxLife ?? buildingMaxLife(b.kind);
+    const lifeFrac = Math.max(0, Math.min(1, (b.life ?? max) / max));
+
+    // A watchtower's reach, shown only when selected so the map isn't cluttered.
+    if (selected && b.kind === 'watchtower') {
+      const r = (BASE_DETECTION_RADIUS + WATCHTOWER_DETECTION_BONUS) * scale;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(125, 107, 138, 0.55)';
+      ctx.fillStyle = 'rgba(125, 107, 138, 0.08)';
+      ctx.lineWidth = Math.max(1, scale * 0.1);
+      ctx.setLineDash([Math.max(3, scale), Math.max(3, scale)]);
+      ctx.beginPath();
+      ctx.arc(x + w / 2, y + h / 2, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // The body. A gate that is currently HELD (open === false) reads barred and darker;
+    // an open gate reads as a passable gap. Walls are solid stone; the rest take their
+    // kind colour. Damage dims the fill so a battered wall visibly weakens.
+    const held = isGate(b.kind) && b.open === false;
+    ctx.save();
+    ctx.globalAlpha = 0.55 + 0.4 * lifeFrac;
+    ctx.fillStyle = held ? '#5a4a2a' : b.color;
+    if (isGate(b.kind) && !held) {
+      // Open gateway: faint fill so the gap reads as a way through, with side posts.
+      ctx.globalAlpha = 0.25;
+      ctx.fillRect(x, y, w, h);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = b.color;
+      const post = Math.max(2, w * 0.22);
+      ctx.fillRect(x, y, post, h);
+      ctx.fillRect(x + w - post, y, post, h);
+    } else {
+      ctx.fillRect(x, y, w, h);
+    }
+    ctx.globalAlpha = 1;
+
+    // A barred gate gets cross-bars; a wall a couple of stone seams for texture.
+    if (held) {
+      ctx.strokeStyle = 'rgba(20, 16, 8, 0.7)';
+      ctx.lineWidth = Math.max(1, scale * 0.2);
+      ctx.beginPath();
+      ctx.moveTo(x, y + h * 0.4);
+      ctx.lineTo(x + w, y + h * 0.4);
+      ctx.moveTo(x, y + h * 0.7);
+      ctx.lineTo(x + w, y + h * 0.7);
+      ctx.stroke();
+    }
+
+    // Outline: amber when selected, a hot red while under siege, else a quiet dark edge.
+    const besieged = (b.siegeProgress ?? 0) > 0;
+    ctx.strokeStyle = selected
+      ? 'rgba(240, 180, 41, 0.95)'
+      : besieged
+        ? 'rgba(248, 81, 73, 0.95)'
+        : 'rgba(13, 17, 23, 0.85)';
+    ctx.lineWidth = selected || besieged ? Math.max(1.5, scale * 0.22) : Math.max(1, scale * 0.12);
+    ctx.strokeRect(x, y, w, h);
+    ctx.lineWidth = 1;
+
+    // A small glyph on the muster buildings (the 1×1 wall/gate stay clean) once they're
+    // big enough to carry one — at a glance you can tell a barracks from a war camp.
+    const glyph = this.fortGlyph(b.kind, held);
+    if (glyph && w >= 16 && h >= 16) {
+      ctx.font = `${Math.max(10, Math.min(20, h * 0.5))}px system-ui, -apple-system, sans-serif`;
+      ctx.fillText(glyph, x + w / 2, y + h / 2 + 0.5);
+    }
+
+    // Structural-health bar across the top while damaged — green→amber→red as it falls.
+    if (lifeFrac < 1) {
+      const barH = Math.max(2, scale * 0.18);
+      ctx.fillStyle = 'rgba(13, 17, 23, 0.7)';
+      ctx.fillRect(x, y - barH - 1, w, barH);
+      ctx.fillStyle = lifeFrac > 0.5 ? '#3fb950' : lifeFrac > 0.25 ? '#d29922' : '#f85149';
+      ctx.fillRect(x, y - barH - 1, w * lifeFrac, barH);
+    }
+    // A red breach bar just under it while actively besieged — fills toward the breach.
+    if (besieged) {
+      const barH = Math.max(2, scale * 0.18);
+      ctx.fillStyle = 'rgba(13, 17, 23, 0.7)';
+      ctx.fillRect(x, y - 1, w, barH);
+      ctx.fillStyle = 'rgba(248, 81, 73, 0.95)';
+      ctx.fillRect(x, y - 1, w * Math.min(1, b.siegeProgress ?? 0), barH);
+    }
+    ctx.restore();
+  }
+
+  /** The little glyph that marks a muster fortification (none for the bare wall). */
+  private fortGlyph(kind: Building['kind'], held: boolean): string {
+    switch (kind) {
+      case 'gate':
+        return held ? '🛡' : '';
+      case 'watchtower':
+        return '🔭';
+      case 'barracks':
+        return '⚔';
+      case 'war_camp':
+        return '🔥';
+      case 'siege_ram':
+        return '🪓';
+      default:
+        return '';
+    }
+  }
+
+  /**
    * Draw a compact resource readout — one tiny labelled bar per stocked resource —
    * pinned to the bottom edge of a building's footprint, so its food/water/… levels
    * (and whether it has run out) are visible right on the map.
@@ -819,23 +983,37 @@ export class Renderer {
   private drawGround(view: WorldView, scale: number): void {
     const { ctx } = this;
     const palette = view.palette ?? DEFAULT_TERRAIN_PALETTE;
+    // A two-village world carries a SECOND palette + a split tile: the west side takes
+    // `palette`, the east side `rivalPalette`, so each settlement reads in its own land.
+    const rivalPalette = view.rivalPalette ?? null;
+    const splitX = rivalPalette && view.paletteSplitX !== null
+      ? Math.max(0, Math.min(view.width, view.paletteSplitX))
+      : null;
 
     const x0 = this.panX;
     const y0 = this.panY;
     const w = view.width * scale;
     const h = view.height * scale;
 
-    // Base fill.
-    ctx.fillStyle = palette.ground;
-    ctx.fillRect(x0, y0, w, h);
+    // Base fill — one slab, or two abutting slabs split at the territory midline.
+    if (splitX !== null && rivalPalette) {
+      const splitPx = splitX * scale;
+      ctx.fillStyle = palette.ground;
+      ctx.fillRect(x0, y0, splitPx, h);
+      ctx.fillStyle = rivalPalette.ground;
+      ctx.fillRect(x0 + splitPx, y0, w - splitPx, h);
+    } else {
+      ctx.fillStyle = palette.ground;
+      ctx.fillRect(x0, y0, w, h);
+    }
 
     // Accent blotches. Spacing in WORLD cells so density holds across zoom levels;
-    // a deterministic hash jitters each blotch's offset, size and presence.
+    // a deterministic hash jitters each blotch's offset, size and presence. Each
+    // blotch takes the accent of whichever side its centre falls on.
     ctx.save();
     ctx.beginPath();
     ctx.rect(x0, y0, w, h); // clip so blotches never spill past the world edge
     ctx.clip();
-    ctx.fillStyle = palette.groundAccent;
     ctx.globalAlpha = 0.5;
     const spacing = 28; // world cells between blotch centres
     const cols = Math.ceil(view.width / spacing);
@@ -849,6 +1027,8 @@ export class Renderer {
         const cx = (gx + 0.5 + jx) * spacing;
         const cy = (gy + 0.5 + jy) * spacing;
         const rad = (6 + ((seed >>> 24) & 0x7)) * scale; // 6..13 cells
+        ctx.fillStyle =
+          splitX !== null && rivalPalette && cx >= splitX ? rivalPalette.groundAccent : palette.groundAccent;
         ctx.beginPath();
         ctx.ellipse(cx * scale + x0, cy * scale + y0, rad, rad * 0.7, 0, 0, Math.PI * 2);
         ctx.fill();

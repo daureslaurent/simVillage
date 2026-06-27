@@ -17,6 +17,7 @@
  */
 
 import type { Villager, VillagerNeeds, Tree, Building, CartPhase, ResourceKind, Vec2, WeatherKind } from '../../shared/types';
+import { DEFAULT_VILLAGE_ID } from '../../shared/types';
 import type { WorldInitPayload, WorldMapUpdatedPayload } from '../../shared/events';
 import { isDepleted, isDepot, SERVICE_REACH } from '../../shared/buildings';
 import { sightRadius, hearingRadius, BASE_SENSE_RADIUS } from '../../shared/perception';
@@ -55,6 +56,8 @@ export interface PerceivedObject {
 /** A village building the villager can sense, with its name so it can be discussed. */
 export interface PerceivedBuilding {
   id: string;
+  /** Which village OWNS this building (v3 rival seam) — lets a mind tell a rival's store from its own. */
+  villageId: string;
   kind: string;
   name: string;
   /** What the place is for, so the mind knows why it might matter. */
@@ -143,13 +146,19 @@ export interface Perception {
    */
   self: {
     id: string;
+    /** Which village this villager belongs to (v3 rival seam) — its own god + side. */
+    villageId: string;
     position: Vec2;
     idle: boolean;
     /** Whether the body is asleep right now — the mind is dark until it wakes at dawn. */
     asleep: boolean;
+    /** Whether the body is downed (beaten back, recovering) — the mind is dark until it mends. */
+    downed: boolean;
     status: string;
     needs: VillagerNeeds;
     backpack: string[];
+    /** The id of the house this villager owns and rests in, or undefined while homeless. */
+    homeId?: string;
     /**
      * The gathering this villager is part of this tick (2+ villagers clustered
      * together), or null when it stands apart. Lets the mind speak to the group
@@ -208,6 +217,14 @@ export class WorldView {
   private weather: WeatherKind = 'clear';
 
   /**
+   * True when at least one villager in THIS villager's village still lacks a home —
+   * recomputed each tick from the snapshot. The utility brain reads it to know whether a
+   * new HOUSE is worth raising (one home per villager); when everyone is housed, no more
+   * houses are proposed.
+   */
+  private housingShortfall = false;
+
+  /**
    * Latest id -> display name for every villager seen in the world stream. A
    * villager knows the names of the people it lives among, so the mind reasons
    * and speaks in names ("Mira") rather than raw ids ("villager_2"). Refreshed
@@ -249,7 +266,7 @@ export class WorldView {
         stock,
         capacity: b.capacity ?? 0,
         empty: isDepleted(b.kind, stock),
-        ...(b.construction ? { needs: b.construction.required } : {}),
+        ...(b.construction ? { needs: this.siteShortfall(b, stock) } : {}),
       };
     });
   }
@@ -259,9 +276,32 @@ export class WorldView {
     this.weather = weather;
   }
 
+  /** True when someone in this villager's village is still without a home (see field doc). */
+  housingNeeded(): boolean {
+    return this.housingShortfall;
+  }
+
   /** The latest known stock of a building: the live overlay if we have one, else its seed stock. */
   private stockOf(b: Building): Partial<Record<ResourceKind, number>> {
     return this.liveStock.get(b.id) ?? b.stock ?? {};
+  }
+
+  /**
+   * For a construction site: the materials it STILL needs to be raised — required
+   * minus what has already been hauled in (clamped at 0). The brain hauls whichever
+   * is most lacking, so reporting the raw `required` total would make a fully-stocked
+   * material (e.g. stone already at its target) keep looking like the biggest need,
+   * livelocking everyone onto it while the real shortfall (goods) is never delivered.
+   */
+  private siteShortfall(
+    b: Building,
+    stock: Partial<Record<ResourceKind, number>>,
+  ): Partial<Record<ResourceKind, number>> {
+    const out: Partial<Record<ResourceKind, number>> = {};
+    for (const [r, need] of Object.entries(b.construction!.required) as [ResourceKind, number][]) {
+      out[r] = Math.max(0, need - (stock[r] ?? 0));
+    }
+    return out;
   }
 
   /** Record the static world: dimensions + trees + buildings. Called on `world.init`. */
@@ -289,6 +329,17 @@ export class WorldView {
     // Refresh the name book from this snapshot, so the mind always knows its
     // neighbours by name (every villager carries its display name on the wire).
     for (const a of payload.villagers) this.names.set(a.id, a.name ?? a.id);
+
+    // Recompute the village's housing shortfall: a fellow villager is homeless when it
+    // has no `homeId` or its home is no longer a standing house. The brain uses this to
+    // raise a new house only while someone still needs one.
+    const myVillage = self.villageId ?? DEFAULT_VILLAGE_ID;
+    const houseIds = new Set(this.buildings.filter((b) => b.kind === 'house').map((b) => b.id));
+    this.housingShortfall = payload.villagers.some(
+      (a) =>
+        (a.villageId ?? DEFAULT_VILLAGE_ID) === myVillage &&
+        (!a.homeId || !houseIds.has(a.homeId)),
+    );
 
     // Fold this tick's building-stock stream into our live overlay before we read
     // any building, so perceived levels (and "empty" flags) are current.
@@ -336,6 +387,7 @@ export class WorldView {
         const stock = this.stockOf(b);
         return {
           id: b.id,
+          villageId: b.villageId ?? DEFAULT_VILLAGE_ID,
           kind: b.kind,
           name: b.name,
           function: b.function ?? '',
@@ -347,7 +399,7 @@ export class WorldView {
           stock,
           capacity: b.capacity ?? 0,
           empty: isDepleted(b.kind, stock),
-          ...(b.construction ? { needs: b.construction.required } : {}),
+          ...(b.construction ? { needs: this.siteShortfall(b, stock) } : {}),
         };
       })
       .filter((b) => b.distance <= sight)
@@ -400,12 +452,15 @@ export class WorldView {
       hearingRadius: hearing,
       self: {
         id: self.id,
+        villageId: self.villageId ?? DEFAULT_VILLAGE_ID,
         position: self.position,
         idle: self.target === null,
         asleep: self.asleep ?? false,
+        downed: self.downed ?? false,
         status: self.status ?? 'Idle',
         needs: self.needs ?? { hunger: 0, thirst: 0, fatigue: 0 },
         backpack: self.backpack ?? [],
+        ...(self.homeId ? { homeId: self.homeId } : {}),
         gathering,
       },
       nearbyVillagers,

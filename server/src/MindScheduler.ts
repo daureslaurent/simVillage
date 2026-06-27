@@ -134,7 +134,9 @@ export class MindScheduler {
       (event) => {
         this.tick = event.payload.tick;
         this.asleep.clear();
-        for (const v of event.payload.villagers) if (v.asleep) this.asleep.add(v.id);
+        // A sleeping OR downed villager's mind is dark — out of the fight, recovering —
+        // so it is never a thinking candidate until the engine restores it.
+        for (const v of event.payload.villagers) if (v.asleep || v.downed) this.asleep.add(v.id);
       },
     );
 

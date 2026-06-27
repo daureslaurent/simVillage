@@ -126,6 +126,17 @@ export class LlamaProvider implements LLMProvider {
   /** Completion-length cap (tokens); undefined = send none, let the server decide. */
   private readonly maxTokens: number | undefined;
   private readonly debug: boolean;
+  /**
+   * Anti-repetition sampling params spread into every request body. A local model
+   * with NO repetition penalty can fall into a degenerate loop — emitting the same
+   * phrase until `max_tokens` — so we always send a mild penalty. `repeat_penalty` +
+   * `repeat_last_n` are llama.cpp's lever; `frequency_penalty`/`presence_penalty` are
+   * the OpenAI-standard ones (also honoured by llama.cpp). All env-tunable. Set a
+   * penalty to its neutral value (1.0 / 0) to disable it.
+   */
+  private readonly sampling: Record<string, number>;
+  /** Loop-detector config: when set, a streamed run is cut short on a detected loop. */
+  private readonly loopGuard: { enabled: boolean; minRepeats: number };
   /** Round-robin cursor; advances one server per decision. */
   private cursor = 0;
 
@@ -137,6 +148,22 @@ export class LlamaProvider implements LLMProvider {
     this.timeoutMs = options.timeoutMs ?? Number(process.env.LLAMA_TIMEOUT_MS ?? 30_000);
     this.maxTokens = options.maxTokens ?? parseMaxTokens(process.env.LLM_MAX_TOKENS);
     this.debug = options.debug ?? isTruthy(process.env.LLAMA_DEBUG);
+    this.sampling = {
+      repeat_penalty: parseFloatEnv(process.env.LLM_REPEAT_PENALTY, 1.1),
+      repeat_last_n: parseIntEnv(process.env.LLM_REPEAT_LAST_N, 256),
+      frequency_penalty: parseFloatEnv(process.env.LLM_FREQUENCY_PENALTY, 0.3),
+      presence_penalty: parseFloatEnv(process.env.LLM_PRESENCE_PENALTY, 0),
+    };
+    this.loopGuard = {
+      // On by default; LLM_LOOP_GUARD=off (or 0/false/no) disables the stream watchdog.
+      enabled: process.env.LLM_LOOP_GUARD === undefined ? true : isTruthy(process.env.LLM_LOOP_GUARD),
+      minRepeats: Math.max(2, parseIntEnv(process.env.LLM_LOOP_GUARD_REPEATS, 4)),
+    };
+  }
+
+  /** A fresh repetition watchdog for one streamed run, or null when the guard is off. */
+  private makeGuard(): RepetitionGuard | null {
+    return this.loopGuard.enabled ? new RepetitionGuard(this.loopGuard.minRepeats) : null;
   }
 
   /** The model tag every chat call currently runs against. */
@@ -264,6 +291,7 @@ export class LlamaProvider implements LLMProvider {
           // Ask for the terminal usage chunk so the tally still works under streaming.
           stream_options: { include_usage: true },
           temperature: 0.7,
+          ...this.sampling,
           response_format: { type: 'json_object' },
           ...(this.maxTokens ? { max_tokens: this.maxTokens } : {}),
           messages,
@@ -273,6 +301,8 @@ export class LlamaProvider implements LLMProvider {
         throw new Error(`responded ${res.status} ${res.statusText}`);
       }
 
+      const guard = this.makeGuard();
+      let looped = false;
       let content = '';
       let usage: LlmUsage | undefined;
       // Walk the SSE stream line-by-line, accumulating content + reasoning.
@@ -294,7 +324,15 @@ export class LlamaProvider implements LLMProvider {
           progress.emitted = true;
           onChunk({ ...(c ? { content: c } : {}), ...(r ? { reasoning: r } : {}) });
         }
+        // Watchdog: if the model has fallen into a repeating loop, cut the stream
+        // short rather than let it spin out to max_tokens (or forever).
+        if (guard && (c || r) && guard.push(c ?? r ?? '')) {
+          console.warn(`[llama] ${baseUrl} repetition loop detected; cutting the stream short`);
+          looped = true;
+          break;
+        }
       }
+      if (looped) controller.abort(); // release the socket; we've stopped reading
 
       return parseJsonDecision(baseUrl, content, usage);
     } finally {
@@ -358,6 +396,7 @@ export class LlamaProvider implements LLMProvider {
           stream: true,
           stream_options: { include_usage: true },
           temperature: 0.7,
+          ...this.sampling,
           tools: tools.map(toOpenAiTool),
           tool_choice: 'auto',
           ...(this.maxTokens ? { max_tokens: this.maxTokens } : {}),
@@ -368,6 +407,8 @@ export class LlamaProvider implements LLMProvider {
         throw new Error(`responded ${res.status} ${res.statusText}`);
       }
 
+      const guard = this.makeGuard();
+      let looped = false;
       let content = '';
       let usage: LlmUsage | undefined;
       const calls = new Map<number, ToolCallAccum>();
@@ -399,7 +440,14 @@ export class LlamaProvider implements LLMProvider {
           if (tc.function?.arguments) acc.args += tc.function.arguments;
           calls.set(idx, acc);
         }
+        // Watchdog: cut a repeating loop short rather than spin to max_tokens.
+        if (guard && (c || r) && guard.push(c ?? r ?? '')) {
+          console.warn(`[llama] ${baseUrl} repetition loop detected; cutting the stream short`);
+          looped = true;
+          break;
+        }
       }
+      if (looped) controller.abort(); // release the socket; we've stopped reading
 
       return assembleTurn(content, calls, usage);
     } finally {
@@ -437,6 +485,7 @@ export class LlamaProvider implements LLMProvider {
           model: this.model,
           stream: false,
           temperature: 0.7,
+          ...this.sampling,
           response_format: { type: 'json_object' },
           // Only sent when configured (LLM_MAX_TOKENS / option); otherwise the
           // server's own default applies, as before.
@@ -666,6 +715,80 @@ function parseMaxTokens(raw: string | undefined): number | undefined {
   if (raw === undefined || raw.trim() === '') return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** A finite float from an env value, or `fallback` for unset/blank/non-numeric. */
+function parseFloatEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** A non-negative integer from an env value, or `fallback` for unset/blank/invalid. */
+function parseIntEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+/**
+ * A streaming repetition watchdog. Fed each visible slice, it keeps a bounded tail
+ * of the output and reports a LOOP once that tail ends in the same block repeated
+ * `minRepeats` times back-to-back — the signature of a model stuck emitting the same
+ * word or phrase. Catches periods from a couple of characters ("ha ha ha …") up to a
+ * long sentence, while requiring several verbatim repeats so ordinary prose (which
+ * rarely repeats a non-trivial block 4× exactly) doesn't trip it. Scans are throttled
+ * to once per {@link STRIDE} new characters so a token-by-token stream stays cheap.
+ */
+class RepetitionGuard {
+  /** Bounded tail of recent output we scan for a cycle. */
+  private buf = '';
+  /** Chars accumulated since the last scan, for stride throttling. */
+  private since = 0;
+
+  /** Longest window we retain + scan (chars). Bounds both memory and scan cost. */
+  private static readonly WINDOW = 800;
+  /** Shortest repeating block to consider, so single repeated spaces don't count. */
+  private static readonly MIN_PERIOD = 2;
+  /** Longest repeating block to consider (a long looped sentence). */
+  private static readonly MAX_PERIOD = 240;
+  /** Only re-scan once this many new chars have arrived. */
+  private static readonly STRIDE = 16;
+
+  constructor(private readonly minRepeats: number) {}
+
+  /** Feed a slice; returns true the first time the tail looks like a runaway loop. */
+  push(slice: string): boolean {
+    if (!slice) return false;
+    this.buf += slice;
+    if (this.buf.length > RepetitionGuard.WINDOW) {
+      this.buf = this.buf.slice(-RepetitionGuard.WINDOW);
+    }
+    this.since += slice.length;
+    if (this.since < RepetitionGuard.STRIDE) return false;
+    this.since = 0;
+    return this.isLooping();
+  }
+
+  /** True when the tail is a `block` repeated `minRepeats`× in a row (block not blank). */
+  private isLooping(): boolean {
+    const s = this.buf;
+    const n = s.length;
+    const maxP = Math.min(RepetitionGuard.MAX_PERIOD, Math.floor(n / this.minRepeats));
+    for (let p = RepetitionGuard.MIN_PERIOD; p <= maxP; p++) {
+      const block = s.slice(n - p);
+      if (block.trim().length < 2) continue; // ignore whitespace-only cycles
+      let ok = true;
+      for (let k = 2; k <= this.minRepeats; k++) {
+        if (s.slice(n - p * k, n - p * (k - 1)) !== block) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
 }
 
 /** Build the explicit JSON output contract injected into the system prompt. */

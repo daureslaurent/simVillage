@@ -33,8 +33,12 @@ import type { MindScheduler } from './MindScheduler';
 import type { RuntimeStateStore } from './persistence/RuntimeStateStore';
 
 export interface MindRegistryDeps {
-  /** The shared world bible handed, unchanged, to every mind. */
-  bible: string;
+  /**
+   * The world bible handed to every mind. A single string for a one-village world, or a
+   * resolver keyed by the villager's `villageId` so each side of a two-village world gets
+   * its OWN themed bible (the LLM rival path).
+   */
+  bible: string | ((villageId: string | undefined) => string);
   /** The vector store backing long-term memory, or null to run minds amnesiac. */
   memoryStore: QdrantMemoryStore | null;
   /** Durable key/value store for each mind's reflected-day watermark. */
@@ -45,6 +49,12 @@ export interface MindRegistryDeps {
   profilesById: Map<string, CharacterProfile>;
   /** Minimum gap between a mind's decisions, in ms (self-pace fallback only). */
   thinkIntervalMs: number;
+  /**
+   * v3 — which BRAIN every villager runs on: `'llm'` (the v2 per-villager language
+   * model) or `'utility'` (the cheap rule-driven UtilityBrain, no LLM). Set
+   * village-wide from `VILLAGER_BRAIN`. Defaults to `'llm'`.
+   */
+  villagerBrain?: 'llm' | 'utility';
   /**
    * Pool routing for a given villager (which endpoint/model its mind runs on), or
    * undefined to let the pool pick a free endpoint. This is the seam for assigning
@@ -118,9 +128,15 @@ export class MindRegistry {
       const profile = this.profileFor(villagerId);
       this.names.set(villagerId, profile.name);
 
-      const memory = this.deps.memoryStore
-        ? new MemoryStream(villagerId, this.llm, this.deps.memoryStore, this.llm, { clock: new SimClock() })
-        : undefined;
+      // v3 — a utility-brained villager never reasons with the LLM, so the costly
+      // language-model satellites (RAG memory + nightly reflection, the daily planner)
+      // are pure waste in that mode: the brain ignores their output. Switch them off so
+      // the village genuinely makes ZERO villager LLM calls (design §11, P1 + §4).
+      const utility = this.deps.villagerBrain === 'utility';
+      const memory =
+        this.deps.memoryStore && !utility
+          ? new MemoryStream(villagerId, this.llm, this.deps.memoryStore, this.llm, { clock: new SimClock() })
+          : undefined;
       // Restore the reflected-day watermark so a reboot during the night doesn't
       // fire a duplicate reflection for the current day.
       const reflectionKey = `reflection:${villagerId}`;
@@ -130,8 +146,13 @@ export class MindRegistry {
       const mind = new AgentService(this.bus, profile, this.llm, {
         thinkIntervalMs: this.deps.thinkIntervalMs,
         coordinated: true, // think on a granted turn from the scheduler
-        bible: this.deps.bible,
-        planner: this.llm, // sketch a daily agenda over the shared /complete seam
+        ...(this.deps.villagerBrain ? { villagerBrain: this.deps.villagerBrain } : {}),
+        bible:
+          typeof this.deps.bible === 'function'
+            ? this.deps.bible(profile.villageId)
+            : this.deps.bible,
+        // The daily planner is an LLM call; only the LLM brain reads its agenda.
+        ...(utility ? {} : { planner: this.llm }), // sketch a daily agenda over the shared /complete seam
         relationships: new RelationshipBook(this.deps.storedBooks.get(villagerId) ?? []),
         roster: () => this.roster(),
         ...(memory ? { memory } : {}),

@@ -27,9 +27,11 @@
  * ---------------------------------------------------------------------------
  */
 
-import type { Villager, AgentDecision, AgentTraceStep, AgendaItem, AgendaPartOfDay, BuildableId, Cart, ResourceKind, Tree, Building, BuildingStock, BuildingEvent, WeatherKind, Conversation, Gathering, Relationship, GroupPlan, EntityType, LlmCallPurpose, SupervisorDailyReportPayload, EffortPurpose, ReasoningEffort, ReasoningEffortSettings, LlmModelConfig, LlmPoolConfig, LlmUsage, VillageVision, TerrainPalette, VillageSize } from './types';
+import type { Villager, AgentDecision, AgentTraceStep, AgendaItem, AgendaPartOfDay, BuildableId, Cart, ResourceKind, Tree, Building, BuildingStock, BuildingEvent, WeatherKind, Conversation, Gathering, Relationship, GroupPlan, EntityType, LlmCallPurpose, SupervisorDailyReportPayload, EffortPurpose, ReasoningEffort, ReasoningEffortSettings, LlmModelConfig, LlmPoolConfig, LlmUsage, VillageVision, VillageScoreboard, TerrainPalette, VillageSize, RivalSetupParams, SpawnableType } from './types';
 
 export type { DivineAct, SupervisorDailyReportPayload, VillageVision } from './types';
+import type { WorldDigestVitals, VillagePolicy, VillageOrder, DigestEvent } from './types';
+export type { WorldDigestVitals, VillagePolicy, VillageOrder, DigestEvent } from './types';
 
 /** The Topic Exchanges that make up the bus, one per direction of the nervous system. */
 export const EXCHANGES = {
@@ -92,6 +94,10 @@ export interface WorldInitPayload {
   setting?: string;
   /** Themed ground colours (see {@link TerrainPalette}); absent in old saves. */
   palette?: TerrainPalette;
+  /** Second ground palette for the rival (east) side of a two-village world. */
+  rivalPalette?: TerrainPalette;
+  /** Tile x where the ground switches from `palette` (west) to `rivalPalette` (east). */
+  paletteSplitX?: number;
 }
 
 /** Per-tick result of processing movement: the moving villagers' new positions. */
@@ -152,6 +158,8 @@ export interface WorldNeedsSetupPayload {
   maxVillagers: number;
   defaultVillagers: number;
   defaultSize: VillageSize;
+  /** Two-village (rival) world — show the rival setup layout. See {@link WorldNeedsSetupMessage.rival}. */
+  rival?: boolean;
 }
 
 /** A fast style-colour preview for the setup screen (answer to `user.config.preview_style`). */
@@ -221,10 +229,26 @@ export interface UserSupervisorVerdictPayload {
   villagerName: string;
   message: string;
   verdict: 'choose' | 'reject';
+  /** Which village's supervisor should hear it (v3 rival seam); absent ⇒ DEFAULT_VILLAGE_ID. */
+  villageId?: string;
 }
 
 /** "Deliberate now." A human nudge for the Supervisor to act off its daily cadence. */
-export type UserSupervisorForceRunPayload = Record<string, never>;
+export interface UserSupervisorForceRunPayload {
+  /** Which village's supervisor to force-run (v3 rival seam); absent ⇒ DEFAULT_VILLAGE_ID. */
+  villageId?: string;
+}
+
+/**
+ * v3 — the human SEIZES (or releases) the wheel: pause the autonomous LLM supervisor so
+ * it stops thinking each day, leaving the human to drive (divine powers + force-run still
+ * work while paused); resume to hand control back. Part of the §8 human override.
+ */
+export interface UserSupervisorPausePayload {
+  paused: boolean;
+  /** Which village's supervisor to pause/resume (v3 rival seam); absent ⇒ DEFAULT_VILLAGE_ID. */
+  villageId?: string;
+}
 
 /**
  * The human god's DIVINE POWERS from the temple console, relayed straight to the
@@ -264,6 +288,8 @@ export type UserSupervisorVerdictEvent =
   EventEnvelope<'user.supervisor.verdict', UserSupervisorVerdictPayload>;
 export type UserSupervisorForceRunEvent =
   EventEnvelope<'user.supervisor.force_run', UserSupervisorForceRunPayload>;
+export type UserSupervisorPauseEvent =
+  EventEnvelope<'user.supervisor.pause', UserSupervisorPausePayload>;
 
 /** The human god's divine powers (single-word keys the engine binding receives). */
 export type UserSetWeatherEvent = EventEnvelope<'user.set_weather', UserSetWeatherPayload>;
@@ -306,6 +332,8 @@ export interface UserGenerateWorldPayload {
   style?: string;
   villagers?: number;
   size?: VillageSize;
+  /** Two-village (rival) selections; see {@link RivalSetupParams}. Present only in rival mode. */
+  rival?: RivalSetupParams;
 }
 export type UserGenerateWorldEvent =
   EventEnvelope<'user.config.generate_world', UserGenerateWorldPayload>;
@@ -329,6 +357,7 @@ export type UserCommandEvent =
   | UserPlantIdeaEvent
   | UserSupervisorVerdictEvent
   | UserSupervisorForceRunEvent
+  | UserSupervisorPauseEvent
   | UserSetWeatherEvent
   | UserSpawnEvent
   | UserBlessEvent
@@ -532,6 +561,12 @@ export type VillagerPrayEvent = EventEnvelope<'villager.pray', VillagerPrayPaylo
  * Villager decides from them whether the village needs a challenge or a reward.
  */
 export interface VillageDailySummaryPayload {
+  /**
+   * Which village this summary is FOR (v3 rival-village seam). The aggregator emits one
+   * summary per village; a supervisor reads only its own. Optional + defaulting to
+   * {@link DEFAULT_VILLAGE_ID} so a single-village world is unchanged.
+   */
+  villageId?: string;
   day: number;
   tick: number;
   population: number;
@@ -552,10 +587,103 @@ export interface VillageDailySummaryPayload {
    * reads to judge how city-like the village has become and to record milestones.
    */
   completedBuilds?: string[];
+  /**
+   * v3 — the aggregate WORLD DIGEST vitals (needs/stocks/buildings) the supervisor
+   * reads to set the village {@link VillagePolicy}. Optional for back-compat: older
+   * summaries (and the very first tick before any villager is seen) omit it.
+   */
+  digest?: WorldDigestVitals;
+  /**
+   * v3 P4 — salient world events the engine detected DURING this day (a famine, a store
+   * run dry, a newcomer, a surplus). The colour that makes the day legible to the god,
+   * beyond the flat vitals. Omitted when the day passed without a notable happening.
+   */
+  events?: DigestEvent[];
 }
 
 export type VillageDailySummaryEvent =
   EventEnvelope<'village.daily_summary', VillageDailySummaryPayload>;
+
+/**
+ * v3 P4 (design §8) — a HIGH-SALIENCE world event that should INTERRUPT the god's daily
+ * cadence: a crisis the village can't wait until nightfall for the god to notice (a famine
+ * setting in, the larder run empty). The supervisor deliberates out-of-turn on receipt,
+ * subject to its pause flag + an interrupt cool-off so a sustained crisis can't spam it.
+ */
+export type VillageAlertEvent = EventEnvelope<'village.alert', DigestEvent>;
+
+/**
+ * v3 P4 (design §7) — a RARE villager-LLM "moment". Under the utility brain villagers are
+ * mute automatons; a moment hands ONE of them a single real language-model turn for a
+ * memorable beat (a cry in a famine, acting on the god's whisper, a festival), then it
+ * drops back to the cheap brain. The {@link MomentCoordinator} owns a small per-day budget
+ * and emits this at the chosen villager; that villager folds `reason` into its prompt and
+ * thinks once with the LLM. A no-op for villagers already on the LLM brain.
+ */
+export interface VillageMomentPayload {
+  /** Which villager is granted the rare LLM turn. */
+  villagerId: string;
+  /** Why — folded into the villager's prompt so its one turn reacts to the occasion. */
+  reason: string;
+  /** What occasioned the moment, for logs/telemetry. */
+  kind: 'crisis' | 'whisper' | 'festival' | 'newcomer';
+}
+
+export type VillageMomentEvent = EventEnvelope<'village.moment', VillageMomentPayload>;
+
+/**
+ * A real-time HEARTBEAT digest, emitted on a wall-clock interval (independent of the
+ * in-game day, which is ~40 real minutes long). It carries the same live per-village
+ * digest as a daily summary so the god can re-tune POLICY and issue ORDERS several times
+ * an hour instead of once a day — the steering layer that keeps the village in motion.
+ * Unlike `village.daily_summary` it advances NO day bookkeeping (no chronicle, vision,
+ * or long-term memory write); it is a pure between-days nudge.
+ */
+export type VillagePulseEvent = EventEnvelope<'village.pulse', VillageDailySummaryPayload>;
+
+/**
+ * The kinds of LIVE world LOOKUP the agentic supervisor may request mid-deliberation.
+ * Each is a read-only question answered from the village read-model the
+ * {@link DailySummaryAggregator} already holds (current villager + building snapshot),
+ * so the god can INVESTIGATE before it acts rather than steer blind off the daily digest.
+ */
+export type SupervisorQueryKind =
+  | 'inspect_villager'
+  | 'list_villagers'
+  | 'list_buildings'
+  | 'scan_rival';
+
+/**
+ * The agentic god ASKING the read-model a question (supervisor -> aggregator). Rides
+ * `supervisor.commands` (the engine + gateway safely ignore the unknown key); the
+ * aggregator answers from its current snapshot with a matching {@link VillageQueryResultEvent}.
+ * `queryId` correlates request and reply; `villageId` scopes the answer to the asking god.
+ */
+export interface SupervisorQueryPayload {
+  /** Globally-unique id correlating this request with its result. */
+  queryId: string;
+  /** Which village is asking — the answer is scoped to it (a rival can't read our roster). */
+  villageId: string;
+  kind: SupervisorQueryKind;
+  /** Lookup specifics, e.g. `{ villagerId }` or `{ buildingKind }`. */
+  args?: { villagerId?: string; buildingKind?: string };
+}
+
+export type SupervisorQueryEvent = EventEnvelope<'supervisor.query', SupervisorQueryPayload>;
+
+/**
+ * The read-model's ANSWER to a {@link SupervisorQueryEvent} (aggregator -> supervisor), keyed
+ * by the request's `queryId`. `summary` is the human-readable prose the god reads back into
+ * its deliberation; `ok` is false when the lookup found nothing (an unknown villager id).
+ */
+export interface VillageQueryResultPayload {
+  queryId: string;
+  ok: boolean;
+  summary: string;
+}
+
+export type VillageQueryResultEvent =
+  EventEnvelope<'village.query_result', VillageQueryResultPayload>;
 
 export type SupervisorDailyReportEvent =
   EventEnvelope<'village.daily_report', SupervisorDailyReportPayload>;
@@ -568,11 +696,23 @@ export type SupervisorDailyReportEvent =
  */
 export type VillageVisionEvent = EventEnvelope<'village.vision', VillageVision>;
 
+/**
+ * The village COMPETITION SCOREBOARD, emitted by the aggregator each pulse + day
+ * boundary: every village's blended 0..100 standing and its per-pillar breakdown.
+ * The gateway forwards it to the browser's HUD + supervisor panel.
+ */
+export type VillageScoreEvent = EventEnvelope<'village.score', VillageScoreboard>;
+
 /** Everything published to `village.events`. Narrow on `.type`. */
 export type VillageEvent =
   | VillageDailySummaryEvent
   | SupervisorDailyReportEvent
-  | VillageVisionEvent;
+  | VillageVisionEvent
+  | VillageScoreEvent
+  | VillageAlertEvent
+  | VillageMomentEvent
+  | VillagePulseEvent
+  | VillageQueryResultEvent;
 
 // ---------------------------------------------------------------------------
 // supervisor.commands  (the "God Agent" -> engine & villagers)
@@ -580,9 +720,13 @@ export type VillageEvent =
 
 /** Introduce a new entity at a tile. `spawn_entity(type, x, y)` on the wire. */
 export interface SupervisorSpawnEntityPayload {
-  entityType: 'villager' | 'tree';
+  entityType: SpawnableType;
   x: number;
   y: number;
+  /** Wall/gate line length in segments (see {@link SpawnEntityCommand.length}). */
+  length?: number;
+  /** Wall line direction: 'h' east, 'v' south (see {@link SpawnEntityCommand.orientation}). */
+  orientation?: 'h' | 'v';
 }
 
 /** Set the village-wide weather. `change_weather(type)` on the wire. */
@@ -597,12 +741,29 @@ export type SupervisorChangeWeatherEvent =
 /** The God Agent's `plant_idea(villager_id, synthetic_memory)`; reuses PlantIdeaPayload. */
 export type SupervisorPlantIdeaEvent =
   EventEnvelope<'supervisor.plant_idea', PlantIdeaPayload>;
+/**
+ * v3 — the supervisor's standing POLICY (`set_priorities`): the priority weights that
+ * steer every villager's utility brain. Broadcast on `supervisor.commands`; the minds
+ * fold it into their scores, and the UI/chronicle can show what the god is steering.
+ */
+export type SupervisorSetPrioritiesEvent =
+  EventEnvelope<'supervisor.set_priorities', VillagePolicy>;
+/**
+ * v3 — a targeted, expiring ORDER (`issue_order`): the supervisor (or a human) pushes
+ * specific villagers at a task for a while. The utility brain folds it in as a large,
+ * soft bonus; it expires by `ttlTicks` and the village relaxes back to policy.
+ */
+export type SupervisorIssueOrderEvent =
+  EventEnvelope<'supervisor.issue_order', VillageOrder>;
 
 /** Everything published to `supervisor.commands`. Narrow on `.type`. */
 export type SupervisorCommandEvent =
   | SupervisorSpawnEntityEvent
   | SupervisorChangeWeatherEvent
-  | SupervisorPlantIdeaEvent;
+  | SupervisorPlantIdeaEvent
+  | SupervisorSetPrioritiesEvent
+  | SupervisorIssueOrderEvent
+  | SupervisorQueryEvent;
 
 // ---------------------------------------------------------------------------
 // villager.telemetry  (villagers -> observers)
@@ -631,13 +792,14 @@ export interface VillagerThoughtProcessPayload {
   /** The validated decision we ACTUALLY published, or null if the turn was skipped. */
   decision: AgentDecision | null;
   /**
-   * Where {@link decision} came from: `'llm'` when the model chose it, `'fallback'`
-   * when the model produced nothing usable (a malformed call, a declined action, or
-   * an engine error) and we substituted a scripted contextual step. A `'fallback'`
-   * turn has an empty (or partial) {@link rawOutput} — it is NOT an authored LLM
-   * decision, so consumers can tell the two apart. Omitted on skipped turns.
+   * Where {@link decision} came from: `'llm'` when the model chose it, `'utility'`
+   * when the v3 rule-driven {@link UtilityBrain} scored and picked it (no LLM call),
+   * `'fallback'` when the model produced nothing usable (a malformed call, a declined
+   * action, or an engine error) and we substituted a scripted contextual step. A
+   * `'fallback'` turn has an empty (or partial) {@link rawOutput} — it is NOT an
+   * authored LLM decision, so consumers can tell the two apart. Omitted on skipped turns.
    */
-  decisionSource?: 'llm' | 'fallback';
+  decisionSource?: 'llm' | 'utility' | 'fallback';
   /**
    * The full agentic TRACE for this turn — every lookup tool, world action, and the
    * final yield, in order — when the mind ran the multi-step loop. Absent for a

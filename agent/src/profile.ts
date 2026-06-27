@@ -40,6 +40,12 @@ export interface CharacterProfile {
   /** Optional flavour the model can draw on; omitted if empty. */
   backstory?: string;
   /**
+   * Which village this villager belongs to (v3 rival-village seam). Lets the mind heed only
+   * its OWN god's steer from the first tick. Optional + defaulting to the single-village id
+   * in the brain; set on a rival roster.
+   */
+  villageId?: string;
+  /**
    * The villager's procedural LOOK, generated alongside the persona on an LLM
    * world build so each inhabitant is visually distinct. Carried here so it lives
    * with the rest of the identity; the seed copies it onto the villager body.

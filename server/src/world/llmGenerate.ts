@@ -37,11 +37,29 @@ import {
   coerceAppearance,
   deriveAppearance,
 } from '../../../shared/appearance';
-import { buildSeedFromPlan, type BuildingPlanItem, type WorldPlan } from './seed';
+import {
+  buildSeedFromPlan,
+  buildRivalSeedFromPlans,
+  type BuildingPlanItem,
+  type WorldPlan,
+} from './seed';
+import { DEFAULT_VILLAGE_ID, RIVAL_VILLAGE_ID } from '../../../shared/types';
 
 /** Render an option vocabulary as a quoted list for a generation prompt. */
 function listFor(opts: readonly string[]): string {
   return opts.map((o) => `"${o}"`).join(', ');
+}
+
+/**
+ * Fold a side's STYLE together with the shared MAP backdrop into one theme line for
+ * the generator. The style leads (it themes the side fully); the backdrop is a wider
+ * setting hint. Either may be empty — with neither, the model invents a style.
+ */
+function combineTheme(style: string, backdrop: string): string {
+  const s = style.trim();
+  const b = backdrop.trim();
+  if (s && b) return `${s}, set within a wider valley of ${b}`;
+  return s || b;
 }
 
 /**
@@ -87,6 +105,30 @@ export interface GeneratedWorld {
   bible: string;
   theme: string;
   setting: string;
+}
+
+/**
+ * One generated village's CONTENT, before it is committed to map coordinates: the
+ * building plan, the roster, the themed bible and the resolved theme/setting. Kept
+ * separate from the seed so the same generation can feed either a single-village
+ * {@link buildSeedFromPlan} or a two-village {@link buildRivalSeedFromPlans}.
+ */
+export interface GeneratedVillageContent {
+  plan: WorldPlan;
+  profiles: CharacterProfile[];
+  bible: string;
+  theme: string;
+  setting: string;
+}
+
+/**
+ * A fully generated TWO-village world (the LLM counterpart of the fixed-blueprint
+ * rival seed): one shared wide map, each side with its own themed roster + bible.
+ */
+export interface GeneratedRivalWorld {
+  seed: WorldSeed;
+  home: { profiles: CharacterProfile[]; bible: string; theme: string; setting: string };
+  rival: { profiles: CharacterProfile[]; bible: string; theme: string; setting: string };
 }
 
 /**
@@ -146,6 +188,14 @@ const DEFAULT_FOOTPRINT: Record<BuildingKind, { w: number; h: number }> = {
   lamp: { w: 1, h: 1 },
   landmark: { w: 3, h: 3 },
   depot: { w: 3, h: 3 },
+  // Fortifications — placed by a god during the war, never by the generator, but the
+  // table must be total. Mirrors FORT_FOOTPRINT in shared/fortifications.ts.
+  wall: { w: 1, h: 1 },
+  gate: { w: 1, h: 1 },
+  watchtower: { w: 2, h: 2 },
+  barracks: { w: 3, h: 3 },
+  war_camp: { w: 3, h: 3 },
+  siege_ram: { w: 2, h: 2 },
 };
 
 // ---------------------------------------------------------------------------
@@ -171,29 +221,69 @@ export async function generateWorldWithLLM(
   // both clamped to the hard ceiling.
   const villagerCount = clampInt(opts.villagers ?? size.villagers, 1, opts.maxVillagers);
 
-  // 1. Overview — the map, the buildings, the villager count. Retried; on total
-  //    failure this throws and the caller falls back.
-  report({ phase: 'map', label: 'Drawing up the lay of the land' });
+  const content = await generateVillageContent(llm, villagerIdFor, {
+    theme,
+    villagerCount,
+    size,
+    retries,
+    report,
+  });
+
+  report({ phase: 'assembling', label: 'Raising the village' });
+  const seed = buildSeedFromPlan(content.plan, content.profiles.map((p) => p.id));
+  stampAppearances(seed, content.profiles);
+  return {
+    seed,
+    profiles: content.profiles,
+    bible: content.bible,
+    theme: content.theme,
+    setting: content.setting,
+  };
+}
+
+/**
+ * Generate the CONTENT of one village (map plan, roster, themed bible) without
+ * committing it to map coordinates. The overview is retried then THROWS on total
+ * failure (the caller falls back); per-villager and bible failures degrade softly.
+ * The optional `labelPrefix` tags progress labels so a two-village build can show
+ * which side it is on.
+ */
+async function generateVillageContent(
+  llm: GenerationLLM,
+  villagerIdFor: (i: number) => string,
+  opts: {
+    theme: string;
+    villagerCount: number;
+    size: { map: number; margin: number; trees: number };
+    retries: number;
+    report: GenerationProgress;
+    labelPrefix?: string;
+  },
+): Promise<GeneratedVillageContent> {
+  const { theme, villagerCount, size, retries, report } = opts;
+  const tag = opts.labelPrefix ?? '';
+
+  // 1. Overview — the map, the buildings. Retried; on total failure this throws.
+  report({ phase: 'map', label: `${tag}Drawing up the lay of the land` });
   const overview = await withRetry(retries, 'overview', () =>
     generateOverview(llm, theme, villagerCount),
   );
-
   const resolvedTheme = overview.theme;
   const setting = overview.setting;
 
   // 2. The building plan, validated + augmented so the economy always closes. The
-  //    player's size choice fixes the map, packing gap and tree cover.
+  //    size choice fixes the map, packing gap and tree cover.
   const plan = buildPlan(overview, { villagerCount, size });
   const buildingSummary = plan.buildings.map((b) => `${b.name} (${b.kind})`).join(', ');
 
-  // 3. One persona per villager, generated in sequence so each can see its peers
-  //    and stay distinct. A failed villager falls back to a themed default.
+  // 3. One persona per villager, in sequence so each can see its peers and stay
+  //    distinct. A failed villager falls back to a themed default.
   const profiles: CharacterProfile[] = [];
   for (let i = 0; i < villagerCount; i++) {
     const id = villagerIdFor(i);
     report({
       phase: 'villagers',
-      label: 'Breathing life into the villagers',
+      label: `${tag}Breathing life into the villagers`,
       step: i + 1,
       total: villagerCount,
     });
@@ -214,7 +304,7 @@ export async function generateWorldWithLLM(
   }
 
   // 4. The themed world bible. Soft fallback to a fixed-flavour bible on failure.
-  report({ phase: 'bible', label: 'Writing the village’s story' });
+  report({ phase: 'bible', label: `${tag}Writing the village’s story` });
   let bible: string;
   try {
     bible = await withRetry(retries, 'bible', () =>
@@ -225,10 +315,14 @@ export async function generateWorldWithLLM(
     bible = composeBible(`You live in ${setting}`, '', plan.buildings);
   }
 
-  report({ phase: 'assembling', label: 'Raising the village' });
-  const seed = buildSeedFromPlan(plan, profiles.map((p) => p.id));
-  // Stamp each generated LOOK onto the matching villager body so the browser draws
-  // the figure the persona was given, and keep the map colour in step with it.
+  return { plan, profiles, bible, theme: resolvedTheme, setting };
+}
+
+/**
+ * Stamp each generated LOOK onto its matching villager body so the browser draws the
+ * figure the persona was given, keeping the map colour in step with it.
+ */
+function stampAppearances(seed: WorldSeed, profiles: CharacterProfile[]): void {
   for (const villager of seed.villagers) {
     const appearance = profiles.find((p) => p.id === villager.id)?.appearance;
     if (appearance) {
@@ -236,7 +330,108 @@ export async function generateWorldWithLLM(
       villager.color = appearance.bodyColor;
     }
   }
-  return { seed, profiles, bible, theme: resolvedTheme, setting };
+}
+
+// ---------------------------------------------------------------------------
+// Two-village (rival) generation — the LLM counterpart of `generateRivalSeed`.
+// ---------------------------------------------------------------------------
+
+/** One side's independent generation parameters in a two-village build. */
+export interface RivalSideOptions {
+  /** This side's STYLE — fully themes its roster, building names and ground palette. */
+  style?: string;
+  /** This side's villager count; clamped to [1, maxVillagers]. Defaults to the size's count. */
+  villagers?: number;
+  /** This side's size/density (map packing + tree cover). Defaults to 'medium'. */
+  size?: VillageSize;
+}
+
+export interface GenerateRivalWorldOptions {
+  /**
+   * The shared MAP/valley backdrop — a loose mood hint folded into BOTH sides' themes
+   * so the two settlements read as one valley. Each side still themes itself fully.
+   */
+  mapTheme?: string;
+  /** Hard ceiling on villagers per side. */
+  maxVillagers: number;
+  /** Retries for the overview/bible calls per side. Default 2. */
+  retries?: number;
+  /** Progress sink (labels are prefixed "Home village — " / "Rival village — "). */
+  onProgress?: GenerationProgress;
+  /** The HOME (west) settlement's parameters. */
+  home: RivalSideOptions;
+  /** The RIVAL (east) settlement's parameters. */
+  rival: RivalSideOptions;
+}
+
+/**
+ * Generate a complete TWO-village world with the LLM: a home settlement themed by the
+ * player's style and a RIVAL settlement themed as its contrasting neighbour across the
+ * valley, laid out on one wide shared map. Each side is generated independently (its
+ * own buildings, roster and bible). THROWS if either side's overview fails after its
+ * retries — the caller falls back to the fixed-blueprint rival seed.
+ */
+export async function generateRivalWorldWithLLM(
+  llm: GenerationLLM,
+  homeIdFor: (i: number) => string,
+  rivalIdFor: (i: number) => string,
+  opts: GenerateRivalWorldOptions,
+): Promise<GeneratedRivalWorld> {
+  const retries = opts.retries ?? 2;
+  const report = opts.onProgress ?? (() => {});
+  const backdrop = (opts.mapTheme ?? '').trim();
+  const homeSize = VILLAGE_SIZES[opts.home.size ?? 'medium'];
+  const rivalSize = VILLAGE_SIZES[opts.rival.size ?? 'medium'];
+  const homeCount = clampInt(opts.home.villagers ?? homeSize.villagers, 1, opts.maxVillagers);
+  const rivalCount = clampInt(opts.rival.villagers ?? rivalSize.villagers, 1, opts.maxVillagers);
+
+  const homeStyle = (opts.home.style ?? '').trim();
+  const rivalStyle = (opts.rival.style ?? '').trim();
+  const homeTheme = combineTheme(homeStyle, backdrop);
+  // The rival uses its OWN style if the player gave one; otherwise it is themed as the
+  // home's contrasting neighbour, so the two still read as one valley's two sides.
+  const rivalTheme = rivalStyle
+    ? combineTheme(rivalStyle, backdrop)
+    : combineTheme(
+        homeStyle
+          ? `a rival settlement that contrasts with and competes against "${homeStyle}" across the same valley`
+          : '',
+        backdrop,
+      );
+
+  const home = await generateVillageContent(llm, homeIdFor, {
+    theme: homeTheme,
+    villagerCount: homeCount,
+    size: homeSize,
+    retries,
+    report,
+    labelPrefix: 'Home village — ',
+  });
+  const rival = await generateVillageContent(llm, rivalIdFor, {
+    theme: rivalTheme,
+    villagerCount: rivalCount,
+    size: rivalSize,
+    retries,
+    report,
+    labelPrefix: 'Rival village — ',
+  });
+
+  report({ phase: 'assembling', label: 'Raising the two villages' });
+  // Stamp ownership onto each side's profiles so the minds heed only their own god.
+  for (const p of home.profiles) p.villageId = DEFAULT_VILLAGE_ID;
+  for (const p of rival.profiles) p.villageId = RIVAL_VILLAGE_ID;
+
+  const seed = buildRivalSeedFromPlans(
+    { plan: home.plan, villagerIds: home.profiles.map((p) => p.id) },
+    { plan: rival.plan, villagerIds: rival.profiles.map((p) => p.id) },
+  );
+  stampAppearances(seed, [...home.profiles, ...rival.profiles]);
+
+  return {
+    seed,
+    home: { profiles: home.profiles, bible: home.bible, theme: home.theme, setting: home.setting },
+    rival: { profiles: rival.profiles, bible: rival.bible, theme: rival.theme, setting: rival.setting },
+  };
 }
 
 // ---------------------------------------------------------------------------
