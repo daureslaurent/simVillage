@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# CPU-only overrides — layered on top of docker-compose.yml for hosts WITHOUT
+# an NVIDIA GPU (e.g. the remote server driven by update_run.sh). It swaps
+# qdrant's CUDA image for the plain CPU build, turns GPU indexing off, and
+# clears the GPU device reservation so Docker doesn't demand a GPU that isn't
+# there. Local `npm run up` keeps using docker-compose.yml alone (GPU image).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+# ---------------------------------------------------------------------------
+services:
+  qdrant:
+    # CPU-only build — no GPU required.
+    image: qdrant/qdrant:v1.13.6
+    environment:
+      QDRANT__GPU__INDEXING: "false"
+    # Drop the NVIDIA GPU reservation from the base file. An empty list is IGNORED on
+    # merge, so we use the `!reset` tag (Compose ≥ 2.24) to clear the whole deploy block
+    # — otherwise Compose would still demand a GPU the remote host doesn't have.
+    deploy: !reset null
